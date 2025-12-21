@@ -10,6 +10,16 @@ const storage = @import("storage.zig");
 const persistence = @import("persistence.zig");
 const redis = @import("redis.zig");
 
+const builtin = @import("builtin");
+const TCP = switch (builtin.target.os.tag) {
+    .linux, .macos => posix.TCP,
+    else => struct {
+        pub const NODELAY: c_int = 1;
+        pub const CORK: c_int = 3;
+        pub const NOPUSH: c_int = 4;
+    },
+};
+
 const PORT = 8085;
 var should_exit = std.atomic.Value(bool).init(false);
 var active_connections = std.atomic.Value(u32).init(0);
@@ -90,7 +100,7 @@ pub fn main() !void {
             break;
         }
 
-        posix.setsockopt(conn, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        posix.setsockopt(conn, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
         if (redis_mode) {
             const thread = try std.Thread.spawn(.{}, handleRedisConnection, .{conn});
@@ -165,8 +175,8 @@ pub fn handleRedisConnection(conn: posix.socket_t) !void {
     var responseBuffer: [2 * 1024 * 1024]u8 = undefined;
     var buffered_len: usize = 0;
 
-    const is_darwin = @import("builtin").target.os.tag == .macos;
-    const cork_option = if (is_darwin) posix.TCP.NOPUSH else posix.TCP.CORK;
+    const is_darwin = builtin.target.os.tag == .macos;
+    const cork_option = if (is_darwin) TCP.NOPUSH else TCP.CORK;
 
     while (true) {
         const n = posix.read(conn, requestBuffer[buffered_len..]) catch |err| {
