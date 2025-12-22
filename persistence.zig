@@ -50,11 +50,13 @@ pub fn init() !void {
         record_count += 1;
         std.debug.print("Restoring record N:{d}\r", .{record_count});
 
-        var recordIterator = std.mem.splitScalar(u8, record, '|');
+        const first_pipe = std.mem.indexOfScalar(u8, record, '|') orelse continue;
+        const opcode = record[0..first_pipe];
 
-        const opcode = recordIterator.first();
-        const key = recordIterator.next() orelse continue;
-        const value = recordIterator.next() orelse continue;
+        const remaining = record[first_pipe + 1 ..];
+        const second_pipe = std.mem.indexOfScalar(u8, remaining, '|') orelse continue;
+        const key = remaining[0..second_pipe];
+        const value = remaining[second_pipe + 1 ..];
 
         const opcodeEnum = std.meta.stringToEnum(OPCode, opcode) orelse continue;
 
