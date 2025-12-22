@@ -12,6 +12,7 @@ var mutex: std.Thread.Mutex = .{};
 
 var write_buffer: [BUFFER_SIZE]u8 = undefined;
 var buffer_position: usize = 0;
+var instant_wal: bool = false;
 
 const OPCode = enum {
     W,
@@ -74,6 +75,10 @@ pub fn init() !void {
     return;
 }
 
+pub fn setInstantWal(enabled: bool) void {
+    instant_wal = enabled;
+}
+
 pub fn persist(opcode: u8, key: []const u8, value: []const u8) void {
     const record_len = 1 + 1 + key.len + 1 + value.len + 1;
 
@@ -132,6 +137,12 @@ pub fn persist(opcode: u8, key: []const u8, value: []const u8) void {
     pos += 1;
 
     buffer_position = pos;
+
+    if (instant_wal) {
+        flushBuffer() catch |err| {
+            std.debug.print("Failed to flush buffer in instant WAL mode: {any}\n", .{err});
+        };
+    }
 }
 
 pub fn flush() !void {

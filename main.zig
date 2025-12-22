@@ -24,6 +24,7 @@ const PORT = 8085;
 var should_exit = std.atomic.Value(bool).init(false);
 var active_connections = std.atomic.Value(u32).init(0);
 var redis_mode = false;
+var instant_wal_mode = false;
 
 fn handleSignal(sig: c_int) callconv(.c) void {
     _ = sig;
@@ -38,6 +39,8 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-redis")) {
             redis_mode = true;
+        } else if (std.mem.eql(u8, arg, "-iwal")) {
+            instant_wal_mode = true;
         }
     }
 
@@ -64,6 +67,11 @@ pub fn main() !void {
 
     storage.init();
     try persistence.init();
+
+    if (instant_wal_mode) {
+        persistence.setInstantWal(true);
+        std.debug.print("Instant WAL mode enabled\n", .{});
+    }
 
     while (!should_exit.load(.seq_cst)) {
         var poll_fds = [_]posix.pollfd{
