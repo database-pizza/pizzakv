@@ -133,11 +133,16 @@ pub fn delete(key: []const u8) void {
     }
 }
 
-fn findNode(node: *RadixNode, key: []const u8) ?*RadixNode {
-    if (key.len == 0) return node;
+fn findNodeForPrefix(node: *RadixNode, prefix: []const u8, actual_path: *[]u8) ?*RadixNode {
+    if (prefix.len == 0) {
+        actual_path.* = &[_]u8{};
+        return node;
+    }
 
     var current = node;
-    var remaining = key;
+    var remaining = prefix;
+    var path_buffer: [MAX_KEY_LENGTH]u8 = undefined;
+    var path_len: usize = 0;
 
     while (remaining.len > 0) {
         var found = false;
@@ -145,28 +150,39 @@ fn findNode(node: *RadixNode, key: []const u8) ?*RadixNode {
         var it = current.children.iterator();
         while (it.next()) |entry| {
             const child = entry.value_ptr.*;
-            const prefix_len = commonPrefixLen(child.edge, remaining);
+            const prefix_match_len = commonPrefixLen(child.edge, remaining);
 
-            if (prefix_len > 0) {
-                if (prefix_len < child.edge.len) {
-                    return null;
-                }
-
-                if (prefix_len == remaining.len) {
+            if (prefix_match_len > 0) {
+                if (prefix_match_len == remaining.len) {
+                    actual_path.* = temp_allocator.dupe(u8, path_buffer[0..path_len]) catch &[_]u8{};
                     return child;
                 }
 
-                remaining = remaining[prefix_len..];
-                current = child;
-                found = true;
-                break;
+                if (prefix_match_len == child.edge.len) {
+                    @memcpy(path_buffer[path_len .. path_len + prefix_match_len], child.edge[0..prefix_match_len]);
+                    path_len += prefix_match_len;
+                    remaining = remaining[prefix_match_len..];
+                    current = child;
+                    found = true;
+                    break;
+                }
+
+                return null;
             }
         }
 
-        if (!found) return null;
+        if (!found) {
+            return null;
+        }
     }
 
+    actual_path.* = temp_allocator.dupe(u8, path_buffer[0..path_len]) catch &[_]u8{};
     return current;
+}
+
+fn findNode(node: *RadixNode, key: []const u8) ?*RadixNode {
+    var dummy_path: []u8 = &[_]u8{};
+    return findNodeForPrefix(node, key, &dummy_path);
 }
 
 pub fn searchByPrefix(prefix: []const u8) ?*RadixNode {
@@ -188,40 +204,47 @@ fn countKeys(node: *RadixNode) usize {
     return count;
 }
 
-const MAX_KEYS_RETURN = 10000;
+const MAX_KEYS_RETURN = 100_000_000;
 const MAX_KEY_LENGTH = 1024;
 
-fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usize, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize) void {
+fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usize, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8, include_node_edge: bool) void {
     if (keys.items.len >= max_keys) return;
 
+    var current_len = prefix_len;
+
+    if (include_node_edge and node.edge.len > 0) {
+        if (current_len + node.edge.len > MAX_KEY_LENGTH) return;
+        @memcpy(prefix_buffer[current_len .. current_len + node.edge.len], node.edge);
+        current_len += node.edge.len;
+    }
+
     if (node.is_terminal) {
-        const key = temp_allocator.dupe(u8, prefix_buffer[0..prefix_len]) catch return;
-        keys.append(temp_allocator, key) catch return;
+        const key = prefix_buffer[0..current_len];
+        if (key.len >= search_prefix.len and std.mem.eql(u8, key[0..search_prefix.len], search_prefix)) {
+            const key_copy = temp_allocator.dupe(u8, key) catch return;
+            keys.append(temp_allocator, key_copy) catch return;
+        }
     }
 
     var it = node.children.iterator();
     while (it.next()) |entry| {
         if (keys.items.len >= max_keys) break;
         const child = entry.value_ptr.*;
-        const edge_len = child.edge.len;
 
-        if (prefix_len + edge_len > MAX_KEY_LENGTH) continue;
-
-        @memcpy(prefix_buffer[prefix_len .. prefix_len + edge_len], child.edge);
-        collectKeysWithBuffer(child, prefix_buffer, prefix_len + edge_len, keys, max_keys);
+        collectKeysWithBuffer(child, prefix_buffer, current_len, keys, max_keys, search_prefix, true);
     }
 }
 
-fn collectKeys(node: *RadixNode, prefix: []const u8, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize) void {
+fn collectKeys(node: *RadixNode, prefix: []const u8, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8) void {
     var prefix_buffer: [MAX_KEY_LENGTH]u8 = undefined;
     if (prefix.len > MAX_KEY_LENGTH) return;
     @memcpy(prefix_buffer[0..prefix.len], prefix);
-    collectKeysWithBuffer(node, &prefix_buffer, prefix.len, keys, max_keys);
+    collectKeysWithBuffer(node, &prefix_buffer, prefix.len, keys, max_keys, search_prefix, true);
 }
 
 pub fn getKeysFromNode(node: *RadixNode, prefix: []const u8) [][]const u8 {
     var keys_list = std.ArrayListUnmanaged([]const u8){};
-    collectKeys(node, prefix, &keys_list, MAX_KEYS_RETURN);
+    collectKeys(node, prefix, &keys_list, MAX_KEYS_RETURN, prefix);
     return keys_list.toOwnedSlice(temp_allocator) catch &[_][]const u8{};
 }
 
@@ -233,7 +256,7 @@ pub fn getKeysByPrefix(prefix: []const u8) []const u8 {
     const node = searchByPrefix(prefix) orelse return "";
     const keys = getKeysFromNode(node, prefix);
     if (keys.len == 0) return "";
-    return std.mem.join(temp_allocator, "\r", keys) catch "";
+    return std.mem.join(temp_allocator, "\n", keys) catch "";
 }
 
 pub fn getValuesByPrefix(prefix: []const u8) []const u8 {
@@ -241,8 +264,16 @@ pub fn getValuesByPrefix(prefix: []const u8) []const u8 {
     defer tree_mutex.unlock();
 
     ensureRoot();
-    const node = searchByPrefix(prefix) orelse return "";
-    const keys = getKeysFromNode(node, prefix);
+
+    var actual_path: []u8 = &[_]u8{};
+    const node = findNodeForPrefix(root, prefix, &actual_path) orelse {
+        return "";
+    };
+
+    var keys_list = std.ArrayListUnmanaged([]const u8){};
+    collectKeys(node, actual_path, &keys_list, MAX_KEYS_RETURN, prefix);
+    const keys = keys_list.toOwnedSlice(temp_allocator) catch &[_][]const u8{};
+
     if (keys.len == 0) return "";
 
     const values = temp_allocator.alloc([]const u8, keys.len) catch return "";
@@ -251,7 +282,7 @@ pub fn getValuesByPrefix(prefix: []const u8) []const u8 {
         values[i] = value;
     }
 
-    return std.mem.join(temp_allocator, "\r", values) catch "";
+    return std.mem.join(temp_allocator, "\n", values) catch "";
 }
 
 pub fn getAllKeys() []const u8 {
@@ -261,5 +292,5 @@ pub fn getAllKeys() []const u8 {
     ensureRoot();
     const keys = getKeysFromNode(root, &[_]u8{});
     if (keys.len == 0) return "";
-    return std.mem.join(temp_allocator, "\r", keys) catch "";
+    return std.mem.join(temp_allocator, "\n", keys) catch "";
 }

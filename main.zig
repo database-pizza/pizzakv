@@ -70,7 +70,7 @@ pub fn main() !void {
 
     if (instant_wal_mode) {
         persistence.setInstantWal(true);
-        std.debug.print("Instant WAL mode enabled\n", .{});
+        std.debug.print("\nInstant WAL mode enabled\n", .{});
     }
 
     while (!should_exit.load(.seq_cst)) {
