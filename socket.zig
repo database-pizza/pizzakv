@@ -2,6 +2,22 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 
+pub fn setReadTimeout(conn: posix.socket_t, seconds: u32) !void {
+    const timeout = posix.timeval{
+        .sec = @intCast(seconds),
+        .usec = 0,
+    };
+    try posix.setsockopt(conn, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+}
+
+pub fn setWriteTimeout(conn: posix.socket_t, seconds: u32) !void {
+    const timeout = posix.timeval{
+        .sec = @intCast(seconds),
+        .usec = 0,
+    };
+    try posix.setsockopt(conn, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
+}
+
 pub fn init(port: u16) !posix.socket_t {
     const address = try std.net.Address.parseIp("0.0.0.0", port);
 

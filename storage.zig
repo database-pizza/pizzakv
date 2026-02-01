@@ -53,25 +53,29 @@ pub fn restore(key: []const u8, value: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
 
-    shards[shard_idx].rwlock.lock();
-    defer shards[shard_idx].rwlock.unlock();
+    var entry_key: []const u8 = undefined;
+    {
+        shards[shard_idx].rwlock.lock();
+        defer shards[shard_idx].rwlock.unlock();
 
-    const entry = writeVolatile(hash, key, value);
-    if (entry != null) {
-        index.insert(entry.?.key);
-        return true;
+        const entry = writeVolatile(hash, key, value) orelse return false;
+        entry_key = entry.key;
     }
-    return false;
+
+    index.insert(entry_key);
+    return true;
 }
 
 pub fn restoreDelete(key: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
 
-    shards[shard_idx].rwlock.lock();
-    defer shards[shard_idx].rwlock.unlock();
+    const deleted = blk: {
+        shards[shard_idx].rwlock.lock();
+        defer shards[shard_idx].rwlock.unlock();
+        break :blk deleteVolatile(hash, key);
+    };
 
-    const deleted = deleteVolatile(hash, key);
     if (deleted) {
         index.delete(key);
         return true;
@@ -112,16 +116,19 @@ pub fn write(key: []const u8, value: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
 
-    shards[shard_idx].rwlock.lock();
-    defer shards[shard_idx].rwlock.unlock();
+    var entry_key: []const u8 = undefined;
+    var entry_value: []const u8 = undefined;
+    {
+        shards[shard_idx].rwlock.lock();
+        defer shards[shard_idx].rwlock.unlock();
 
-    const entry = writeVolatile(hash, key, value);
-    if (entry == null) {
-        return false;
+        const entry = writeVolatile(hash, key, value) orelse return false;
+        entry_key = entry.key;
+        entry_value = entry.value;
     }
 
-    index.insert(entry.?.key);
-    persistence.persist('W', entry.?.key, entry.?.value);
+    index.insert(entry_key);
+    persistence.persist('W', entry_key, entry_value);
     return true;
 }
 
@@ -178,10 +185,13 @@ pub fn deleteVolatile(hash: u32, key: []const u8) bool {
 pub fn delete(key: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
-    shards[shard_idx].rwlock.lock();
-    defer shards[shard_idx].rwlock.unlock();
 
-    const deleted = deleteVolatile(hash, key);
+    const deleted = blk: {
+        shards[shard_idx].rwlock.lock();
+        defer shards[shard_idx].rwlock.unlock();
+        break :blk deleteVolatile(hash, key);
+    };
+
     if (deleted) {
         index.delete(key);
         persistence.persist('D', key, "");

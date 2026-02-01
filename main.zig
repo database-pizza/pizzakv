@@ -109,6 +109,8 @@ pub fn main() !void {
         }
 
         posix.setsockopt(conn, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        socket.setReadTimeout(conn, 300) catch {};  // 5 minutes
+        socket.setWriteTimeout(conn, 300) catch {};  // 5 minutes
 
         if (redis_mode) {
             const thread = try std.Thread.spawn(.{}, handleRedisConnection, .{conn});
@@ -146,17 +148,20 @@ pub fn handleConnection(conn: posix.socket_t) !void {
     defer posix.close(conn);
 
     var requestBuffer: [1024 * 1024]u8 = undefined;
+    var response_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer response_arena.deinit();
 
     while (true) {
         const n = socket.readUntilCR(conn, &requestBuffer) catch |err| {
             if (err == error.ConnectionClosed) break;
+            if (err == error.WouldBlock) continue;
             return err;
         };
         if (n == 0) {
             break;
         }
 
-        const cmdResponse = command.parse(requestBuffer[0..n]) orelse {
+        const cmdResponse = command.parse(requestBuffer[0..n], response_arena.allocator()) orelse {
             socket.write(conn, "error\r") catch |err| {
                 std.debug.print("error writing: {any}", .{err});
             };
@@ -171,6 +176,9 @@ pub fn handleConnection(conn: posix.socket_t) !void {
         socket.writev(conn, &iovecs) catch |err| {
             std.debug.print("error writing: {any}", .{err});
         };
+
+        // Free temporary allocations from this request
+        _ = response_arena.reset(.retain_capacity);
     }
 }
 

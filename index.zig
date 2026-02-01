@@ -3,7 +3,6 @@ const storage = @import("storage.zig");
 
 var tree_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const tree_allocator = tree_arena.allocator();
-const temp_allocator = std.heap.c_allocator;
 
 var tree_mutex: std.Thread.Mutex = .{};
 
@@ -133,16 +132,15 @@ pub fn delete(key: []const u8) void {
     }
 }
 
-fn findNodeForPrefix(node: *RadixNode, prefix: []const u8, actual_path: *[]u8) ?*RadixNode {
+fn findNodeForPrefix(node: *RadixNode, prefix: []const u8, path_buf: *[MAX_KEY_LENGTH]u8, path_len: *usize) ?*RadixNode {
     if (prefix.len == 0) {
-        actual_path.* = &[_]u8{};
+        path_len.* = 0;
         return node;
     }
 
     var current = node;
     var remaining = prefix;
-    var path_buffer: [MAX_KEY_LENGTH]u8 = undefined;
-    var path_len: usize = 0;
+    path_len.* = 0;
 
     while (remaining.len > 0) {
         var found = false;
@@ -154,13 +152,13 @@ fn findNodeForPrefix(node: *RadixNode, prefix: []const u8, actual_path: *[]u8) ?
 
             if (prefix_match_len > 0) {
                 if (prefix_match_len == remaining.len) {
-                    actual_path.* = temp_allocator.dupe(u8, path_buffer[0..path_len]) catch &[_]u8{};
                     return child;
                 }
 
                 if (prefix_match_len == child.edge.len) {
-                    @memcpy(path_buffer[path_len .. path_len + prefix_match_len], child.edge[0..prefix_match_len]);
-                    path_len += prefix_match_len;
+                    if (path_len.* + prefix_match_len > MAX_KEY_LENGTH) return null;
+                    @memcpy(path_buf[path_len.* .. path_len.* + prefix_match_len], child.edge[0..prefix_match_len]);
+                    path_len.* += prefix_match_len;
                     remaining = remaining[prefix_match_len..];
                     current = child;
                     found = true;
@@ -176,13 +174,13 @@ fn findNodeForPrefix(node: *RadixNode, prefix: []const u8, actual_path: *[]u8) ?
         }
     }
 
-    actual_path.* = temp_allocator.dupe(u8, path_buffer[0..path_len]) catch &[_]u8{};
     return current;
 }
 
 fn findNode(node: *RadixNode, key: []const u8) ?*RadixNode {
-    var dummy_path: []u8 = &[_]u8{};
-    return findNodeForPrefix(node, key, &dummy_path);
+    var dummy_buf: [MAX_KEY_LENGTH]u8 = undefined;
+    var dummy_len: usize = 0;
+    return findNodeForPrefix(node, key, &dummy_buf, &dummy_len);
 }
 
 pub fn searchByPrefix(prefix: []const u8) ?*RadixNode {
@@ -207,7 +205,7 @@ fn countKeys(node: *RadixNode) usize {
 const MAX_KEYS_RETURN = 100_000_000;
 const MAX_KEY_LENGTH = 1024;
 
-fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usize, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8, include_node_edge: bool) void {
+fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usize, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8, include_node_edge: bool, allocator: std.mem.Allocator) void {
     if (keys.items.len >= max_keys) return;
 
     var current_len = prefix_len;
@@ -221,8 +219,8 @@ fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usiz
     if (node.is_terminal) {
         const key = prefix_buffer[0..current_len];
         if (key.len >= search_prefix.len and std.mem.eql(u8, key[0..search_prefix.len], search_prefix)) {
-            const key_copy = temp_allocator.dupe(u8, key) catch return;
-            keys.append(temp_allocator, key_copy) catch return;
+            const key_copy = allocator.dupe(u8, key) catch return;
+            keys.append(allocator, key_copy) catch return;
         }
     }
 
@@ -231,66 +229,72 @@ fn collectKeysWithBuffer(node: *RadixNode, prefix_buffer: []u8, prefix_len: usiz
         if (keys.items.len >= max_keys) break;
         const child = entry.value_ptr.*;
 
-        collectKeysWithBuffer(child, prefix_buffer, current_len, keys, max_keys, search_prefix, true);
+        collectKeysWithBuffer(child, prefix_buffer, current_len, keys, max_keys, search_prefix, true, allocator);
     }
 }
 
-fn collectKeys(node: *RadixNode, prefix: []const u8, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8) void {
+fn collectKeys(node: *RadixNode, prefix: []const u8, keys: *std.ArrayListUnmanaged([]const u8), max_keys: usize, search_prefix: []const u8, allocator: std.mem.Allocator) void {
     var prefix_buffer: [MAX_KEY_LENGTH]u8 = undefined;
     if (prefix.len > MAX_KEY_LENGTH) return;
     @memcpy(prefix_buffer[0..prefix.len], prefix);
-    collectKeysWithBuffer(node, &prefix_buffer, prefix.len, keys, max_keys, search_prefix, true);
+    collectKeysWithBuffer(node, &prefix_buffer, prefix.len, keys, max_keys, search_prefix, true, allocator);
 }
 
-pub fn getKeysFromNode(node: *RadixNode, prefix: []const u8) [][]const u8 {
+pub fn getKeysFromNode(node: *RadixNode, prefix: []const u8, allocator: std.mem.Allocator) [][]const u8 {
     var keys_list = std.ArrayListUnmanaged([]const u8){};
-    collectKeys(node, prefix, &keys_list, MAX_KEYS_RETURN, prefix);
-    return keys_list.toOwnedSlice(temp_allocator) catch &[_][]const u8{};
+    collectKeys(node, prefix, &keys_list, MAX_KEYS_RETURN, prefix, allocator);
+    return keys_list.toOwnedSlice(allocator) catch &[_][]const u8{};
 }
 
-pub fn getKeysByPrefix(prefix: []const u8) []const u8 {
+pub fn getKeysByPrefix(prefix: []const u8, allocator: std.mem.Allocator) []const u8 {
     tree_mutex.lock();
     defer tree_mutex.unlock();
 
     ensureRoot();
     const node = searchByPrefix(prefix) orelse return "";
-    const keys = getKeysFromNode(node, prefix);
+    const keys = getKeysFromNode(node, prefix, allocator);
     if (keys.len == 0) return "";
-    return std.mem.join(temp_allocator, "\n", keys) catch "";
+    return std.mem.join(allocator, "\n", keys) catch "";
 }
 
-pub fn getValuesByPrefix(prefix: []const u8) []const u8 {
-    tree_mutex.lock();
-    defer tree_mutex.unlock();
+pub fn getValuesByPrefix(prefix: []const u8, allocator: std.mem.Allocator) []const u8 {
+    // Phase 1: Collect matching keys under tree_mutex
+    var keys: [][]const u8 = &[_][]const u8{};
+    {
+        tree_mutex.lock();
+        defer tree_mutex.unlock();
 
-    ensureRoot();
+        ensureRoot();
 
-    var actual_path: []u8 = &[_]u8{};
-    const node = findNodeForPrefix(root, prefix, &actual_path) orelse {
-        return "";
-    };
+        var path_buf: [MAX_KEY_LENGTH]u8 = undefined;
+        var path_len: usize = 0;
+        const node = findNodeForPrefix(root, prefix, &path_buf, &path_len) orelse {
+            return "";
+        };
 
-    var keys_list = std.ArrayListUnmanaged([]const u8){};
-    collectKeys(node, actual_path, &keys_list, MAX_KEYS_RETURN, prefix);
-    const keys = keys_list.toOwnedSlice(temp_allocator) catch &[_][]const u8{};
+        var keys_list = std.ArrayListUnmanaged([]const u8){};
+        collectKeys(node, path_buf[0..path_len], &keys_list, MAX_KEYS_RETURN, prefix, allocator);
+        keys = keys_list.toOwnedSlice(allocator) catch &[_][]const u8{};
+    }
 
     if (keys.len == 0) return "";
 
-    const values = temp_allocator.alloc([]const u8, keys.len) catch return "";
+    // Phase 2: Read values without tree_mutex to avoid deadlock with write/delete
+    const values = allocator.alloc([]const u8, keys.len) catch return "";
     for (keys, 0..) |key, i| {
         const value = storage.read(key) orelse "";
         values[i] = value;
     }
 
-    return std.mem.join(temp_allocator, "\n", values) catch "";
+    return std.mem.join(allocator, "\n", values) catch "";
 }
 
-pub fn getAllKeys() []const u8 {
+pub fn getAllKeys(allocator: std.mem.Allocator) []const u8 {
     tree_mutex.lock();
     defer tree_mutex.unlock();
 
     ensureRoot();
-    const keys = getKeysFromNode(root, &[_]u8{});
+    const keys = getKeysFromNode(root, &[_]u8{}, allocator);
     if (keys.len == 0) return "";
-    return std.mem.join(temp_allocator, "\n", keys) catch "";
+    return std.mem.join(allocator, "\n", keys) catch "";
 }

@@ -20,17 +20,17 @@ fn parseKeyValue(buf: []const u8) ?[2][]const u8 {
     return [2][]const u8{ key, kvIterator.rest() };
 }
 
-pub fn parse(msg: []const u8) ?[]const u8 {
+pub fn parse(msg: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     const trimSet = [_]u8{ '\n', ' ', '\r' };
     const cleanMsg = std.mem.trim(u8, msg, &trimSet);
     var messageIterator = std.mem.splitAny(u8, cleanMsg, " ");
 
     const cmdString = messageIterator.first();
-    const command = std.meta.stringToEnum(Command, cmdString) orelse {
+    const cmd = std.meta.stringToEnum(Command, cmdString) orelse {
         return null;
     };
 
-    switch (command) {
+    switch (cmd) {
         .read => {
             const key = messageIterator.rest();
 
@@ -62,11 +62,11 @@ pub fn parse(msg: []const u8) ?[]const u8 {
             return SUCCESS_RESPONSE;
         },
         .keys => {
-            return index.getAllKeys();
+            return index.getAllKeys(allocator);
         },
         .reads => {
             const prefix = messageIterator.rest();
-            return index.getValuesByPrefix(prefix);
+            return index.getValuesByPrefix(prefix, allocator);
         },
         .status => {
             return "well going our operation";
