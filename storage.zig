@@ -199,3 +199,110 @@ pub fn delete(key: []const u8) bool {
 
     return deleted;
 }
+
+// -- Tests --
+
+test "writeVolatile and read basic" {
+    init();
+    const hash = hashing.hashKey("test_key");
+    const shard_idx = getShardIndex(hash);
+
+    shards[shard_idx].rwlock.lock();
+    _ = writeVolatile(hash, "test_key", "test_value");
+    shards[shard_idx].rwlock.unlock();
+
+    const val = read("test_key") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("test_value", val);
+}
+
+test "writeVolatile overwrites existing key" {
+    init();
+    const hash = hashing.hashKey("overwrite_key");
+    const shard_idx = getShardIndex(hash);
+
+    shards[shard_idx].rwlock.lock();
+    _ = writeVolatile(hash, "overwrite_key", "first");
+    shards[shard_idx].rwlock.unlock();
+
+    shards[shard_idx].rwlock.lock();
+    _ = writeVolatile(hash, "overwrite_key", "second");
+    shards[shard_idx].rwlock.unlock();
+
+    const val = read("overwrite_key") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("second", val);
+}
+
+test "read nonexistent key returns null" {
+    init();
+    try std.testing.expectEqual(@as(?[]const u8, null), read("no_such_key_xyz"));
+}
+
+test "deleteVolatile removes entry" {
+    init();
+    const hash = hashing.hashKey("del_key");
+    const shard_idx = getShardIndex(hash);
+
+    shards[shard_idx].rwlock.lock();
+    _ = writeVolatile(hash, "del_key", "val");
+    shards[shard_idx].rwlock.unlock();
+
+    try std.testing.expect(read("del_key") != null);
+
+    shards[shard_idx].rwlock.lock();
+    const deleted = deleteVolatile(hash, "del_key");
+    shards[shard_idx].rwlock.unlock();
+
+    try std.testing.expect(deleted);
+    try std.testing.expectEqual(@as(?[]const u8, null), read("del_key"));
+}
+
+test "deleteVolatile nonexistent key returns false" {
+    init();
+    const hash = hashing.hashKey("ghost_key");
+    const shard_idx = getShardIndex(hash);
+
+    shards[shard_idx].rwlock.lock();
+    const deleted = deleteVolatile(hash, "ghost_key");
+    shards[shard_idx].rwlock.unlock();
+
+    try std.testing.expect(!deleted);
+}
+
+test "multiple keys in same shard" {
+    init();
+    // Write several keys and verify they don't interfere
+    const keys = [_][]const u8{ "shard_a", "shard_b", "shard_c" };
+    const vals = [_][]const u8{ "val_a", "val_b", "val_c" };
+
+    for (keys, vals) |k, v| {
+        const hash = hashing.hashKey(k);
+        const shard_idx = getShardIndex(hash);
+        shards[shard_idx].rwlock.lock();
+        _ = writeVolatile(hash, k, v);
+        shards[shard_idx].rwlock.unlock();
+    }
+
+    for (keys, vals) |k, v| {
+        const val = read(k) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(v, val);
+    }
+}
+
+test "empty key and value" {
+    init();
+    const hash = hashing.hashKey("");
+    const shard_idx = getShardIndex(hash);
+
+    shards[shard_idx].rwlock.lock();
+    _ = writeVolatile(hash, "", "");
+    shards[shard_idx].rwlock.unlock();
+
+    const val = read("") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", val);
+}
+
+test "getShardIndex stays in bounds" {
+    try std.testing.expect(getShardIndex(0) < NUM_SHARDS);
+    try std.testing.expect(getShardIndex(std.math.maxInt(u32)) < NUM_SHARDS);
+    try std.testing.expect(getShardIndex(12345) < NUM_SHARDS);
+}

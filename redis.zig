@@ -229,3 +229,144 @@ pub fn executeCommand(cmd: RedisCommand, response_buf: []u8) []const u8 {
         },
     }
 }
+
+// -- Tests --
+
+fn buildRedisArray(parts: []const []const u8) []u8 {
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    buf[pos] = '*';
+    pos += 1;
+    pos += formatInt(buf[pos..], parts.len);
+    buf[pos] = '\r';
+    buf[pos + 1] = '\n';
+    pos += 2;
+
+    for (parts) |part| {
+        buf[pos] = '$';
+        pos += 1;
+        pos += formatInt(buf[pos..], part.len);
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+        @memcpy(buf[pos .. pos + part.len], part);
+        pos += part.len;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+    }
+
+    return buf[0..pos];
+}
+
+test "parseCommand SET" {
+    const input = buildRedisArray(&.{ "SET", "mykey", "myvalue" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(CommandType.SET, result.cmd.cmd_type);
+    try std.testing.expectEqualStrings("mykey", result.cmd.key);
+    try std.testing.expectEqualStrings("myvalue", result.cmd.value);
+}
+
+test "parseCommand GET" {
+    const input = buildRedisArray(&.{ "GET", "mykey" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(CommandType.GET, result.cmd.cmd_type);
+    try std.testing.expectEqualStrings("mykey", result.cmd.key);
+}
+
+test "parseCommand DEL" {
+    const input = buildRedisArray(&.{ "DEL", "mykey" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(CommandType.DEL, result.cmd.cmd_type);
+    try std.testing.expectEqualStrings("mykey", result.cmd.key);
+}
+
+test "parseCommand case insensitive" {
+    const input = buildRedisArray(&.{ "set", "k", "v" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(CommandType.SET, result.cmd.cmd_type);
+}
+
+test "parseCommand unknown command" {
+    const input = buildRedisArray(&.{ "FOO", "bar" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(CommandType.UNKNOWN, result.cmd.cmd_type);
+}
+
+test "parseCommand empty input" {
+    try std.testing.expectEqual(@as(?ParseResult, null), parseCommand(""));
+}
+
+test "parseCommand malformed input" {
+    try std.testing.expectEqual(@as(?ParseResult, null), parseCommand("garbage"));
+    try std.testing.expectEqual(@as(?ParseResult, null), parseCommand("*"));
+    try std.testing.expectEqual(@as(?ParseResult, null), parseCommand("*1\r\n"));
+}
+
+test "parseCommand bytes_consumed" {
+    const input = buildRedisArray(&.{ "GET", "key1" });
+    const result = parseCommand(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(input.len, result.bytes_consumed);
+}
+
+test "formatInt zero" {
+    var buf: [20]u8 = undefined;
+    const len = formatInt(&buf, 0);
+    try std.testing.expectEqualStrings("0", buf[0..len]);
+}
+
+test "formatInt positive" {
+    var buf: [20]u8 = undefined;
+    const len = formatInt(&buf, 12345);
+    try std.testing.expectEqualStrings("12345", buf[0..len]);
+}
+
+test "formatSimpleString" {
+    var buf: [64]u8 = undefined;
+    const result = formatSimpleString(&buf, "OK");
+    try std.testing.expectEqualStrings("+OK\r\n", result);
+}
+
+test "formatBulkString" {
+    var buf: [64]u8 = undefined;
+    const result = formatBulkString(&buf, "hello");
+    try std.testing.expectEqualStrings("$5\r\nhello\r\n", result);
+}
+
+test "formatNullBulkString" {
+    var buf: [64]u8 = undefined;
+    const result = formatNullBulkString(&buf);
+    try std.testing.expectEqualStrings("$-1\r\n", result);
+}
+
+test "formatError" {
+    var buf: [64]u8 = undefined;
+    const result = formatError(&buf, "ERR bad");
+    try std.testing.expectEqualStrings("-ERR bad\r\n", result);
+}
+
+test "formatInteger positive" {
+    var buf: [64]u8 = undefined;
+    const result = formatInteger(&buf, 42);
+    try std.testing.expectEqualStrings(":42\r\n", result);
+}
+
+test "formatInteger zero" {
+    var buf: [64]u8 = undefined;
+    const result = formatInteger(&buf, 0);
+    try std.testing.expectEqualStrings(":0\r\n", result);
+}
+
+test "formatInteger negative" {
+    var buf: [64]u8 = undefined;
+    const result = formatInteger(&buf, -7);
+    try std.testing.expectEqualStrings(":-7\r\n", result);
+}
+
+test "executeCommand UNKNOWN" {
+    var buf: [256]u8 = undefined;
+    const cmd = RedisCommand{ .cmd_type = .UNKNOWN, .key = "", .value = "" };
+    const result = executeCommand(cmd, &buf);
+    try std.testing.expectEqualStrings("-ERR unknown command\r\n", result);
+}

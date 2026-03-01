@@ -1,5 +1,8 @@
 main
+.claude
 tools/
 .db
 .dbb
 test_nov.js
+bin/
+.DS_Store

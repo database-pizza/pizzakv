@@ -81,19 +81,19 @@ pub fn insert(key: []const u8) void {
                     break;
                 } else {
                     const old_edge = child.edge;
-                    const common = old_edge[0..prefix_len];
-                    const child_suffix = old_edge[prefix_len..];
                     const key_suffix = remaining[prefix_len..];
 
-                    const intermediate = RadixNode.init(common);
+                    // Dupe before freeing old_edge
+                    const child_suffix = tree_allocator.dupe(u8, old_edge[prefix_len..]) catch unreachable;
+                    const intermediate = RadixNode.init(old_edge[0..prefix_len]);
 
-                    tree_allocator.free(child.edge);
-                    child.edge = tree_allocator.dupe(u8, child_suffix) catch unreachable;
-
-                    intermediate.children.put(child_suffix, child) catch unreachable;
-
+                    // Remove old entry before freeing
                     _ = node.children.remove(old_edge);
-                    node.children.put(common, intermediate) catch unreachable;
+                    tree_allocator.free(old_edge);
+
+                    child.edge = child_suffix;
+                    intermediate.children.put(child_suffix, child) catch unreachable;
+                    node.children.put(intermediate.edge, intermediate) catch unreachable;
 
                     if (key_suffix.len == 0) {
                         intermediate.is_terminal = true;
@@ -297,4 +297,109 @@ pub fn getAllKeys(allocator: std.mem.Allocator) []const u8 {
     const keys = getKeysFromNode(root, &[_]u8{}, allocator);
     if (keys.len == 0) return "";
     return std.mem.join(allocator, "\n", keys) catch "";
+}
+
+// -- Tests --
+
+const test_allocator = std.heap.page_allocator;
+
+test "commonPrefixLen" {
+    try std.testing.expectEqual(@as(usize, 3), commonPrefixLen("abc", "abcdef"));
+    try std.testing.expectEqual(@as(usize, 3), commonPrefixLen("abcdef", "abc"));
+    try std.testing.expectEqual(@as(usize, 0), commonPrefixLen("abc", "xyz"));
+    try std.testing.expectEqual(@as(usize, 0), commonPrefixLen("", "abc"));
+    try std.testing.expectEqual(@as(usize, 0), commonPrefixLen("abc", ""));
+    try std.testing.expectEqual(@as(usize, 5), commonPrefixLen("hello", "hello"));
+}
+
+test "insert and searchByPrefix" {
+    insert("idx_apple");
+    insert("idx_app");
+    insert("idx_banana");
+
+    try std.testing.expect(searchByPrefix("idx_apple") != null);
+    try std.testing.expect(searchByPrefix("idx_banana") != null);
+    try std.testing.expect(searchByPrefix("idx_xyz") == null);
+}
+
+test "insert duplicate key does not crash" {
+    insert("idx_dup");
+    insert("idx_dup");
+    // Node should exist and be terminal
+    const node = searchByPrefix("idx_dup");
+    try std.testing.expect(node != null);
+    try std.testing.expect(node.?.is_terminal);
+}
+
+test "delete marks non-terminal" {
+    insert("idx_delme");
+    const node_before = searchByPrefix("idx_delme");
+    try std.testing.expect(node_before != null);
+    try std.testing.expect(node_before.?.is_terminal);
+
+    delete("idx_delme");
+
+    const node_after = searchByPrefix("idx_delme");
+    try std.testing.expect(node_after != null);
+    try std.testing.expect(!node_after.?.is_terminal);
+}
+
+test "getAllKeys returns inserted keys" {
+    insert("idx_all_a");
+    insert("idx_all_b");
+
+    const result = getAllKeys(test_allocator);
+
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result, "idx_all_a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "idx_all_b") != null);
+}
+
+test "insert empty key is no-op" {
+    insert("");
+}
+
+test "radix tree prefix splitting" {
+    insert("idx_test");
+    insert("idx_testing");
+    insert("idx_tested");
+    insert("idx_tester");
+
+    // All four keys should be findable
+    try std.testing.expect(searchByPrefix("idx_test") != null);
+    try std.testing.expect(searchByPrefix("idx_testing") != null);
+    try std.testing.expect(searchByPrefix("idx_tested") != null);
+    try std.testing.expect(searchByPrefix("idx_tester") != null);
+
+    // Verify terminals
+    const node_test = searchByPrefix("idx_test");
+    try std.testing.expect(node_test.?.is_terminal);
+    const node_testing = searchByPrefix("idx_testing");
+    try std.testing.expect(node_testing.?.is_terminal);
+}
+
+test "searchByPrefix returns null for missing prefix" {
+    try std.testing.expect(searchByPrefix("zzz_nonexistent") == null);
+}
+
+test "countKeys counts terminal nodes" {
+    ensureRoot();
+    insert("idx_cnt_a");
+    insert("idx_cnt_b");
+    insert("idx_cnt_c");
+
+    const node = searchByPrefix("idx_cnt") orelse return error.TestUnexpectedResult;
+    const count = countKeys(node);
+    try std.testing.expect(count >= 3);
+}
+
+test "getValuesByPrefix with storage" {
+    storage.init();
+    _ = storage.restore("idx_pv_key1", "val1");
+    _ = storage.restore("idx_pv_key2", "val2");
+
+    const result = getValuesByPrefix("idx_pv_key", test_allocator);
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result, "val1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "val2") != null);
 }
