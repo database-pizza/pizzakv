@@ -19,8 +19,9 @@ const TCP = switch (builtin.target.os.tag) {
         pub const NOPUSH: c_int = 4;
     },
 };
-
-const PORT = 8085;
+//main.zig:23:12: error: variable of type 'comptime_int' must be const or comptime
+// var PORT = 8085;
+var PORT: u16 = 8085;
 var should_exit = std.atomic.Value(bool).init(false);
 var active_connections = std.atomic.Value(u32).init(0);
 var redis_mode = false;
@@ -41,6 +42,18 @@ pub fn main() !void {
             redis_mode = true;
         } else if (std.mem.eql(u8, arg, "-iwal")) {
             instant_wal_mode = true;
+        } else if (arg.len > 6 and std.mem.eql(u8, arg[0..6], "-port=")) {
+            const port_str = arg[6..];
+            const parsed_port = try std.fmt.parseInt(u16, port_str, 10);
+            if (parsed_port != 0) {
+                PORT = parsed_port;
+            } else {
+                std.debug.print("Invalid port number: {any}\n", .{port_str});
+                return;
+            }
+        } else {
+            std.debug.print("Unknown argument: {any}\n", .{arg});
+            return;
         }
     }
 
@@ -54,17 +67,6 @@ pub fn main() !void {
     _ = posix.sigaction(posix.SIG.TERM, &act, null);
     _ = posix.sigaction(posix.SIG.INT, &act, null);
 
-    const listener = try socket.init(PORT);
-    defer posix.close(listener);
-
-    std.debug.print("2025 pizzakv! TCP Listening on port {any}\n<danilo@fragoso.dev>\n---------\n", .{PORT});
-    if (redis_mode) {
-        std.debug.print("Mode: Redis Protocol (RESP)\nCommands: SET, GET, DEL\n", .{});
-    } else {
-        std.debug.print("Commands:\n\nread key\nwrite key|value\ndelete key\nkeys\nreads prefix\nstatus\n", .{});
-    }
-    std.debug.print("---------\n", .{});
-
     storage.init();
     try persistence.init();
 
@@ -72,6 +74,17 @@ pub fn main() !void {
         persistence.setInstantWal(true);
         std.debug.print("\nInstant WAL mode enabled\n", .{});
     }
+
+    const listener = try socket.init(PORT);
+    defer posix.close(listener);
+
+    std.debug.print("\n2025 pizzakv! TCP Listening on port {any}\n<danilo@fragoso.dev>\n---------\n", .{PORT});
+    if (redis_mode) {
+        std.debug.print("Mode: Redis Protocol (RESP)\nCommands: SET, GET, DEL\n", .{});
+    } else {
+        std.debug.print("Commands:\n\nread key\nwrite key|value\ndelete key\nkeys\nreads prefix\nstatus\n", .{});
+    }
+    std.debug.print("---------\n", .{});
 
     while (!should_exit.load(.seq_cst)) {
         var poll_fds = [_]posix.pollfd{
@@ -109,8 +122,8 @@ pub fn main() !void {
         }
 
         posix.setsockopt(conn, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-        socket.setReadTimeout(conn, 300) catch {};  // 5 minutes
-        socket.setWriteTimeout(conn, 300) catch {};  // 5 minutes
+        socket.setReadTimeout(conn, 300) catch {}; // 5 minutes
+        socket.setWriteTimeout(conn, 300) catch {}; // 5 minutes
 
         if (redis_mode) {
             const thread = try std.Thread.spawn(.{}, handleRedisConnection, .{conn});

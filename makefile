@@ -1,7 +1,7 @@
 default: build
 
 run:
-	zig run main.zig 
+	zig run main.zig
 
 build:
 	zig build-exe main.zig -O ReleaseFast --name pizzakv
@@ -20,7 +20,7 @@ build-amd64-static:
 	mv pizzakv_amd64_static ./bin/pizzakv_amd64_static
 
 install: build
-	mv pizzakv /usr/local/bin/pizzakv
+	mv ./bin/pizzakv /usr/local/bin/pizzakv
 
 clean:
 	rm -f pizzakv
