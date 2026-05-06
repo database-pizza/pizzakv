@@ -1,7 +1,6 @@
 const std = @import("std");
 const storage = @import("storage.zig");
 
-const MAX_PERSISTENCE_SIZE = 10_000_000 * 100;
 const BUFFER_SIZE = 1024 * 1024 * 8;
 const FLUSH_THRESHOLD = (BUFFER_SIZE * 3) / 4;
 
@@ -35,36 +34,11 @@ pub fn init() !void {
         return;
     };
 
-    const storage_data = storage_file.?.readToEndAlloc(c_allocator, MAX_PERSISTENCE_SIZE) catch |err| {
+    var record_count: usize = 0;
+    restoreFromFile(storage_file.?, &record_count) catch |err| {
         std.debug.print("Failed to read storage file: {any}\n", .{err});
         return;
     };
-    defer c_allocator.free(storage_data);
-    var records = std.mem.splitScalar(u8, storage_data, '\r');
-    var record_count: usize = 0;
-    while (records.next()) |record| {
-        if (record.len == 0) {
-            continue;
-        }
-
-        record_count += 1;
-        std.debug.print("Restoring record N:{d}\r", .{record_count});
-
-        const first_pipe = std.mem.indexOfScalar(u8, record, '|') orelse continue;
-        const opcode = record[0..first_pipe];
-
-        const remaining = record[first_pipe + 1 ..];
-        const second_pipe = std.mem.indexOfScalar(u8, remaining, '|') orelse continue;
-        const key = remaining[0..second_pipe];
-        const value = remaining[second_pipe + 1 ..];
-
-        const opcodeEnum = std.meta.stringToEnum(OPCode, opcode) orelse continue;
-
-        switch (opcodeEnum) {
-            .W => _ = storage.restore(key, value),
-            .D => _ = storage.restoreDelete(key),
-        }
-    }
     std.debug.print("Restored {d} records from persistence", .{record_count});
 
     storage_file.?.close();
@@ -75,6 +49,57 @@ pub fn init() !void {
     try storage_file.?.seekFromEnd(0);
 
     return;
+}
+
+fn restoreFromFile(file: std.fs.File, record_count: *usize) !void {
+    var read_buffer: [BUFFER_SIZE]u8 = undefined;
+    var record_buffer = std.ArrayListUnmanaged(u8){};
+    defer record_buffer.deinit(c_allocator);
+
+    while (true) {
+        const n = try file.read(&read_buffer);
+        if (n == 0) break;
+
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, read_buffer[0..n], start, '\r')) |end| {
+            try record_buffer.appendSlice(c_allocator, read_buffer[start..end]);
+            restoreRecord(record_buffer.items, record_count);
+            record_buffer.clearRetainingCapacity();
+            start = end + 1;
+        }
+
+        if (start < n) {
+            try record_buffer.appendSlice(c_allocator, read_buffer[start..n]);
+        }
+    }
+
+    if (record_buffer.items.len > 0) {
+        restoreRecord(record_buffer.items, record_count);
+    }
+}
+
+fn restoreRecord(record: []const u8, record_count: *usize) void {
+    if (record.len == 0) {
+        return;
+    }
+
+    record_count.* += 1;
+    std.debug.print("Restoring record N:{d}\r", .{record_count.*});
+
+    const first_pipe = std.mem.indexOfScalar(u8, record, '|') orelse return;
+    const opcode = record[0..first_pipe];
+
+    const remaining = record[first_pipe + 1 ..];
+    const second_pipe = std.mem.indexOfScalar(u8, remaining, '|') orelse return;
+    const key = remaining[0..second_pipe];
+    const value = remaining[second_pipe + 1 ..];
+
+    const opcodeEnum = std.meta.stringToEnum(OPCode, opcode) orelse return;
+
+    switch (opcodeEnum) {
+        .W => _ = storage.restore(key, value),
+        .D => _ = storage.restoreDelete(key),
+    }
 }
 
 pub fn setInstantWal(enabled: bool) void {

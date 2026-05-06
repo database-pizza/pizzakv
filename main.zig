@@ -26,6 +26,7 @@ var should_exit = std.atomic.Value(bool).init(false);
 var active_connections = std.atomic.Value(u32).init(0);
 var redis_mode = false;
 var instant_wal_mode = false;
+var unix_mode = false;
 
 fn handleSignal(sig: c_int) callconv(.c) void {
     _ = sig;
@@ -40,6 +41,8 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-redis")) {
             redis_mode = true;
+        } else if (std.mem.eql(u8, arg, "-unix")) {
+            unix_mode = true;
         } else if (std.mem.eql(u8, arg, "-iwal")) {
             instant_wal_mode = true;
         } else if (arg.len > 6 and std.mem.eql(u8, arg[0..6], "-port=")) {
@@ -75,10 +78,16 @@ pub fn main() !void {
         std.debug.print("\nInstant WAL mode enabled\n", .{});
     }
 
-    const listener = try socket.init(PORT);
+    const unix_path = ".pizzakv.sock";
+    const listener = if (unix_mode) try socket.initUnix(unix_path) else try socket.init(PORT);
     defer posix.close(listener);
+    defer if (unix_mode) posix.unlink(unix_path) catch {};
 
-    std.debug.print("\n2025 pizzakv! TCP Listening on port {any}\n<danilo@fragoso.dev>\n---------\n", .{PORT});
+    if (unix_mode) {
+        std.debug.print("\n2025 pizzakv! Unix socket at {s}\n<danilo@fragoso.dev>\n---------\n", .{unix_path});
+    } else {
+        std.debug.print("\n2025 pizzakv! TCP Listening on port {any}\n<danilo@fragoso.dev>\n---------\n", .{PORT});
+    }
     if (redis_mode) {
         std.debug.print("Mode: Redis Protocol (RESP)\nCommands: SET, GET, DEL\n", .{});
     } else {
@@ -121,7 +130,7 @@ pub fn main() !void {
             break;
         }
 
-        posix.setsockopt(conn, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        if (!unix_mode) posix.setsockopt(conn, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
         socket.setReadTimeout(conn, 300) catch {}; // 5 minutes
         socket.setWriteTimeout(conn, 300) catch {}; // 5 minutes
 

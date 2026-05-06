@@ -35,6 +35,15 @@ pub fn init(port: u16) !posix.socket_t {
     return listener;
 }
 
+pub fn initUnix(path: []const u8) !posix.socket_t {
+    posix.unlink(path) catch {};
+    const address = try net.Address.initUnix(path);
+    const listener = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    try posix.listen(listener, 1024);
+    return listener;
+}
+
 pub fn readUntilCR(conn: posix.socket_t, buf: []u8) !usize {
     var total: usize = 0;
 
