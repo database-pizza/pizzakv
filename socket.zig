@@ -76,20 +76,17 @@ pub fn read(conn: posix.socket_t, buf: []u8) !usize {
 }
 
 pub fn write(conn: posix.socket_t, msg: []const u8) !void {
-    const written = try posix.write(conn, msg);
-    if (written != msg.len) {
-        return error.PartialWrite;
+    var offset: usize = 0;
+    while (offset < msg.len) {
+        const written = try posix.write(conn, msg[offset..]);
+        if (written == 0) return error.ConnectionClosed;
+        offset += written;
     }
 }
 
 pub fn writev(conn: posix.socket_t, iovecs: []const posix.iovec_const) !void {
-    var total: usize = 0;
     for (iovecs) |iov| {
-        total += iov.len;
-    }
-
-    const written = try posix.writev(conn, iovecs);
-    if (written != total) {
-        return error.PartialWrite;
+        const bytes: [*]const u8 = @ptrCast(iov.base);
+        try write(conn, bytes[0..iov.len]);
     }
 }

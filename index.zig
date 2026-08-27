@@ -282,7 +282,7 @@ pub fn getValuesByPrefix(prefix: []const u8, allocator: std.mem.Allocator) []con
     // Phase 2: Read values without tree_mutex to avoid deadlock with write/delete
     const values = allocator.alloc([]const u8, keys.len) catch return "";
     for (keys, 0..) |key, i| {
-        const value = storage.read(key) orelse "";
+        const value = storage.readAlloc(key, allocator) orelse "";
         values[i] = value;
     }
 

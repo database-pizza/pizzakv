@@ -34,7 +34,7 @@ pub fn parse(msg: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
         .read => {
             const key = messageIterator.rest();
 
-            const value = storage.read(key) orelse {
+            const value = storage.readAlloc(key, allocator) orelse {
                 return FAILURE_RESPONSE;
             };
 

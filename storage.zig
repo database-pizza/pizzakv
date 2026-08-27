@@ -116,19 +116,16 @@ pub fn write(key: []const u8, value: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
 
-    var entry_key: []const u8 = undefined;
-    var entry_value: []const u8 = undefined;
     {
         shards[shard_idx].rwlock.lock();
         defer shards[shard_idx].rwlock.unlock();
 
         const entry = writeVolatile(hash, key, value) orelse return false;
-        entry_key = entry.key;
-        entry_value = entry.value;
+        // Prefix scans must see the index entry before this write becomes
+        // visible to another connection.
+        index.insert(entry.key);
+        persistence.persist('W', entry.key, entry.value);
     }
-
-    index.insert(entry_key);
-    persistence.persist('W', entry_key, entry_value);
     return true;
 }
 
@@ -149,6 +146,24 @@ pub fn read(key: []const u8) ?[]const u8 {
         current = entry.next;
     }
 
+    return null;
+}
+
+pub fn readAlloc(key: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    if (!shards_initialized) return null;
+
+    const hash = hashing.hashKey(key);
+    const shard_idx = getShardIndex(hash);
+    shards[shard_idx].rwlock.lockShared();
+    defer shards[shard_idx].rwlock.unlockShared();
+
+    var current = shards[shard_idx].buckets[hash % shards[shard_idx].buckets.len];
+    while (current) |entry| {
+        if (entry.hash == hash and std.mem.eql(u8, entry.key, key)) {
+            return allocator.dupe(u8, entry.value) catch null;
+        }
+        current = entry.next;
+    }
     return null;
 }
 
