@@ -20,35 +20,24 @@ const OPCode = enum {
 
 pub fn init() !void {
     const cwd = std.fs.cwd();
-    storage_file = cwd.openFile(".db", .{ .mode = .read_write }) catch |err| {
+    storage_file = cwd.openFile(".db", .{ .mode = .read_write }) catch |err| blk: {
         if (err == std.fs.File.OpenError.FileNotFound) {
             std.debug.print("No persisted data found, starting fresh...\n", .{});
-
-            storage_file = cwd.createFile(".db", .{ .read = true }) catch |ierr| {
-                std.debug.print("Failed to create storage file: {any}\n", .{ierr});
-                return;
-            };
-
+            const file = try cwd.createFile(".db", .{ .read = true });
             std.debug.print("Created new storage file .db\n", .{});
+            break :blk file;
+        } else {
+            return err;
         }
-        return;
     };
 
     var record_count: usize = 0;
-    restoreFromFile(storage_file.?, &record_count) catch |err| {
-        std.debug.print("Failed to read storage file: {any}\n", .{err});
-        return;
-    };
+    try restoreFromFile(storage_file.?, &record_count);
     std.debug.print("Restored {d} records from persistence", .{record_count});
 
     storage_file.?.close();
-    storage_file = cwd.openFile(".db", .{ .mode = .write_only }) catch |err| {
-        std.debug.print("Failed to reopen storage file in append mode: {any}\n", .{err});
-        return;
-    };
+    storage_file = try cwd.openFile(".db", .{ .mode = .write_only });
     try storage_file.?.seekFromEnd(0);
-
-    return;
 }
 
 fn restoreFromFile(file: std.fs.File, record_count: *usize) !void {
@@ -106,69 +95,52 @@ pub fn setInstantWal(enabled: bool) void {
     instant_wal = enabled;
 }
 
-pub fn persist(opcode: u8, key: []const u8, value: []const u8) void {
-    const record_len = 1 + 1 + key.len + 1 + value.len + 1;
+fn recordLen(key: []const u8, value: []const u8) usize {
+    return 1 + 1 + key.len + 1 + value.len + 1;
+}
+
+fn encodeRecord(buf: []u8, opcode: u8, key: []const u8, value: []const u8) usize {
+    var pos: usize = 0;
+    buf[pos] = opcode;
+    pos += 1;
+    buf[pos] = '|';
+    pos += 1;
+    @memcpy(buf[pos .. pos + key.len], key);
+    pos += key.len;
+    buf[pos] = '|';
+    pos += 1;
+    @memcpy(buf[pos .. pos + value.len], value);
+    pos += value.len;
+    buf[pos] = '\r';
+    pos += 1;
+    return pos;
+}
+
+fn syncFile() !void {
+    if (storage_file) |f| {
+        try f.sync();
+    }
+}
+
+pub fn persist(opcode: u8, key: []const u8, value: []const u8) !void {
+    const record_len = recordLen(key, value);
 
     mutex.lock();
     defer mutex.unlock();
 
-    if (buffer_position + record_len > FLUSH_THRESHOLD) {
-        flushBuffer() catch |err| {
-            std.debug.print("Failed to flush buffer: {any}\n", .{err});
-            return;
-        };
-    }
-
     if (record_len > BUFFER_SIZE) {
-        var temp_buffer: [BUFFER_SIZE]u8 = undefined;
-        var pos: usize = 0;
-        temp_buffer[pos] = opcode;
-        pos += 1;
-        temp_buffer[pos] = '|';
-        pos += 1;
-        @memcpy(temp_buffer[pos .. pos + key.len], key);
-        pos += key.len;
-        temp_buffer[pos] = '|';
-        pos += 1;
-        @memcpy(temp_buffer[pos .. pos + value.len], value);
-        pos += value.len;
-        temp_buffer[pos] = '\r';
-        pos += 1;
-
-        _ = storage_file.?.write(temp_buffer[0..pos]) catch |err| {
-            std.debug.print("Failed to write large record to storage file: {any}\n", .{err});
-            return;
-        };
-        return;
+        return error.RecordTooLarge;
     }
 
-    if (buffer_position + record_len > BUFFER_SIZE) {
-        flushBuffer() catch |err| {
-            std.debug.print("Failed to flush buffer: {any}\n", .{err});
-            return;
-        };
+    if (buffer_position + record_len > FLUSH_THRESHOLD) {
+        try flushBuffer();
     }
 
-    var pos = buffer_position;
-    write_buffer[pos] = opcode;
-    pos += 1;
-    write_buffer[pos] = '|';
-    pos += 1;
-    @memcpy(write_buffer[pos .. pos + key.len], key);
-    pos += key.len;
-    write_buffer[pos] = '|';
-    pos += 1;
-    @memcpy(write_buffer[pos .. pos + value.len], value);
-    pos += value.len;
-    write_buffer[pos] = '\r';
-    pos += 1;
-
-    buffer_position = pos;
+    buffer_position += encodeRecord(write_buffer[buffer_position..], opcode, key, value);
 
     if (instant_wal) {
-        flushBuffer() catch |err| {
-            std.debug.print("Failed to flush buffer in instant WAL mode: {any}\n", .{err});
-        };
+        try flushBuffer();
+        try syncFile();
     }
 }
 
@@ -176,6 +148,7 @@ pub fn flush() !void {
     mutex.lock();
     defer mutex.unlock();
     try flushBuffer();
+    try syncFile();
 }
 
 fn flushBuffer() !void {
@@ -183,6 +156,27 @@ fn flushBuffer() !void {
         return;
     }
 
-    _ = try storage_file.?.write(write_buffer[0..buffer_position]);
+    const f = storage_file orelse return error.StorageFileNotOpen;
+    try f.writeAll(write_buffer[0..buffer_position]);
     buffer_position = 0;
+}
+
+// -- Tests --
+
+test "recordLen matches encoded record length" {
+    try std.testing.expectEqual(@as(usize, 4 + 3 + 5), recordLen("key", "value"));
+    try std.testing.expectEqual(@as(usize, 4), recordLen("", ""));
+}
+
+test "encodeRecord produces WAL framing" {
+    var buf: [64]u8 = undefined;
+    const written = encodeRecord(&buf, 'W', "key1", "value1");
+    try std.testing.expectEqualStrings("W|key1|value1\r", buf[0..written]);
+    try std.testing.expectEqual(@as(usize, recordLen("key1", "value1")), written);
+}
+
+test "encodeRecord delete framing" {
+    var buf: [64]u8 = undefined;
+    const written = encodeRecord(&buf, 'D', "key2", "");
+    try std.testing.expectEqualStrings("D|key2|\r", buf[0..written]);
 }

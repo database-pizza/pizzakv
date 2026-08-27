@@ -22,6 +22,7 @@ const TCP = switch (builtin.target.os.tag) {
 //main.zig:23:12: error: variable of type 'comptime_int' must be const or comptime
 // var PORT = 8085;
 var PORT: u16 = 8085;
+var HOST: []const u8 = "127.0.0.1";
 var should_exit = std.atomic.Value(bool).init(false);
 var active_connections = std.atomic.Value(u32).init(0);
 var redis_mode = false;
@@ -54,6 +55,8 @@ pub fn main() !void {
                 std.debug.print("Invalid port number: {any}\n", .{port_str});
                 return;
             }
+        } else if (arg.len > 6 and std.mem.eql(u8, arg[0..6], "-host=")) {
+            HOST = arg[6..];
         } else {
             std.debug.print("Unknown argument: {any}\n", .{arg});
             return;
@@ -79,14 +82,14 @@ pub fn main() !void {
     }
 
     const unix_path = ".pizzakv.sock";
-    const listener = if (unix_mode) try socket.initUnix(unix_path) else try socket.init(PORT);
+    const listener = if (unix_mode) try socket.initUnix(unix_path) else try socket.init(HOST, PORT);
     defer posix.close(listener);
     defer if (unix_mode) posix.unlink(unix_path) catch {};
 
     if (unix_mode) {
         std.debug.print("\n2025 pizzakv! Unix socket at {s}\n<danilo@fragoso.dev>\n---------\n", .{unix_path});
     } else {
-        std.debug.print("\n2025 pizzakv! TCP Listening on port {any}\n<danilo@fragoso.dev>\n---------\n", .{PORT});
+        std.debug.print("\n2025 pizzakv! TCP Listening on {s}:{any}\n<danilo@fragoso.dev>\n---------\n", .{ HOST, PORT });
     }
     if (redis_mode) {
         std.debug.print("Mode: Redis Protocol (RESP)\nCommands: SET, GET, DEL\n", .{});
@@ -204,6 +207,15 @@ pub fn handleConnection(conn: posix.socket_t) !void {
     }
 }
 
+fn sendAll(conn: posix.socket_t, buf: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const sent = try posix.send(conn, buf[offset..], posix.MSG.NOSIGNAL);
+        if (sent == 0) return error.ConnectionClosed;
+        offset += sent;
+    }
+}
+
 pub fn handleRedisConnection(conn: posix.socket_t) !void {
     _ = active_connections.fetchAdd(1, .seq_cst);
     defer _ = active_connections.fetchSub(1, .seq_cst);
@@ -234,17 +246,36 @@ pub fn handleRedisConnection(conn: posix.socket_t) !void {
                 break;
             };
 
-            const response = redis.executeCommand(result.cmd, responseBuffer[response_offset..]);
-            response_offset += response.len;
+            // Mutating commands have small responses. Flush first when the
+            // remaining output slice is small so SET/DEL are never retried
+            // after their side effect has already happened.
+            if (response_offset > 0 and responseBuffer.len - response_offset < 64 and result.cmd.cmd_type != .GET) {
+                try sendAll(conn, responseBuffer[0..response_offset]);
+                response_offset = 0;
+            }
+
+            var response = redis.executeCommand(result.cmd, responseBuffer[response_offset..]);
+            if (response == null) {
+                if (response_offset > 0) {
+                    try sendAll(conn, responseBuffer[0..response_offset]);
+                    response_offset = 0;
+                }
+                response = redis.executeCommand(result.cmd, responseBuffer[0..]) orelse
+                    redis.formatError(responseBuffer[0..], "ERR response too large");
+            }
+
+            const final_response = response orelse {
+                offset += result.bytes_consumed;
+                continue;
+            };
+            response_offset += final_response.len;
             offset += result.bytes_consumed;
         }
 
         posix.setsockopt(conn, posix.IPPROTO.TCP, cork_option, &std.mem.toBytes(@as(c_int, 0))) catch {};
 
         if (response_offset > 0) {
-            _ = posix.send(conn, responseBuffer[0..response_offset], posix.MSG.NOSIGNAL) catch |err| {
-                std.debug.print("error writing: {any}", .{err});
-            };
+            try sendAll(conn, responseBuffer[0..response_offset]);
         }
 
         if (offset < total_len) {

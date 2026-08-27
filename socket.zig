@@ -18,8 +18,8 @@ pub fn setWriteTimeout(conn: posix.socket_t, seconds: u32) !void {
     try posix.setsockopt(conn, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
 }
 
-pub fn init(port: u16) !posix.socket_t {
-    const address = try std.net.Address.parseIp("0.0.0.0", port);
+pub fn init(host: []const u8, port: u16) !posix.socket_t {
+    const address = try std.net.Address.parseIp(host, port);
 
     const tpe: u32 = posix.SOCK.STREAM;
     const protocol = posix.IPPROTO.TCP;

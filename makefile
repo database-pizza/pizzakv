@@ -31,6 +31,7 @@ test:
 	zig test storage.zig
 	zig test index.zig
 	zig test command.zig
+	zig test persistence.zig
 
 bench:
 	node tools/test_nov.js

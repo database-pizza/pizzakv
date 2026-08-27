@@ -120,11 +120,11 @@ pub fn write(key: []const u8, value: []const u8) bool {
         shards[shard_idx].rwlock.lock();
         defer shards[shard_idx].rwlock.unlock();
 
+        // Persist before publishing the mutation so a durability failure is
+        // never returned after the new value has become visible in memory.
+        persistence.persist('W', key, value) catch return false;
         const entry = writeVolatile(hash, key, value) orelse return false;
-        // Prefix scans must see the index entry before this write becomes
-        // visible to another connection.
         index.insert(entry.key);
-        persistence.persist('W', entry.key, entry.value);
     }
     return true;
 }
@@ -201,15 +201,26 @@ pub fn delete(key: []const u8) bool {
     const hash = hashing.hashKey(key);
     const shard_idx = getShardIndex(hash);
 
-    const deleted = blk: {
-        shards[shard_idx].rwlock.lock();
-        defer shards[shard_idx].rwlock.unlock();
-        break :blk deleteVolatile(hash, key);
-    };
+    shards[shard_idx].rwlock.lock();
+    defer shards[shard_idx].rwlock.unlock();
 
+    const bucket_idx = hash % shards[shard_idx].buckets.len;
+    var current = shards[shard_idx].buckets[bucket_idx];
+    var exists = false;
+    while (current) |entry| {
+        if (entry.hash == hash and std.mem.eql(u8, entry.key, key)) {
+            exists = true;
+            break;
+        }
+        current = entry.next;
+    }
+    if (!exists) return false;
+
+    // Keep the hash table and radix index unchanged if persistence fails.
+    persistence.persist('D', key, "") catch return false;
+    const deleted = deleteVolatile(hash, key);
     if (deleted) {
         index.delete(key);
-        persistence.persist('D', key, "");
     }
 
     return deleted;
