@@ -1,4 +1,8 @@
 main
+pizzakv
+.zig-cache/
+*.pkvdb
+.pizzakv.sock
 .claude
 tools/
 .db

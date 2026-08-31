@@ -1,145 +1,80 @@
 const std = @import("std");
-const storage = @import("storage.zig");
-const index = @import("index.zig");
+const Engine = @import("engine.zig").Engine;
 
-const FAILURE_RESPONSE = "error";
-const SUCCESS_RESPONSE = "success";
+const max_text_response = 1024 * 1024;
 
-const Command = enum {
-    read,
-    write,
-    delete,
-    status,
-    keys,
-    reads,
-};
-
-fn parseKeyValue(buf: []const u8) ?[2][]const u8 {
-    var kvIterator = std.mem.splitAny(u8, buf, "|");
-    const key = kvIterator.first();
-    return [2][]const u8{ key, kvIterator.rest() };
-}
-
-pub fn parse(msg: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
-    const trimSet = [_]u8{ '\n', ' ', '\r' };
-    const cleanMsg = std.mem.trim(u8, msg, &trimSet);
-    var messageIterator = std.mem.splitAny(u8, cleanMsg, " ");
-
-    const cmdString = messageIterator.first();
-    const cmd = std.meta.stringToEnum(Command, cmdString) orelse {
-        return null;
-    };
-
-    switch (cmd) {
-        .read => {
-            const key = messageIterator.rest();
-
-            const value = storage.readAlloc(key, allocator) orelse {
-                return FAILURE_RESPONSE;
-            };
-
-            return value;
-        },
-        .write => {
-            const kvPair = messageIterator.rest();
-
-            const kv = parseKeyValue(kvPair) orelse {
-                return FAILURE_RESPONSE;
-            };
-
-            if (storage.write(kv[0], kv[1])) {
-                return SUCCESS_RESPONSE;
-            }
-
-            return FAILURE_RESPONSE;
-        },
-        .delete => {
-            const key = messageIterator.rest();
-            if (!storage.delete(key)) {
-                return FAILURE_RESPONSE;
-            }
-
-            return SUCCESS_RESPONSE;
-        },
-        .keys => {
-            return index.getAllKeys(allocator);
-        },
-        .reads => {
-            const prefix = messageIterator.rest();
-            return index.getValuesByPrefix(prefix, allocator);
-        },
-        .status => {
-            return "well going our operation";
-        },
+pub fn execute(engine: *Engine, allocator: std.mem.Allocator, message: []const u8) ![]u8 {
+    const clean = std.mem.trim(u8, message, "\r\n ");
+    const split = std.mem.indexOfScalar(u8, clean, ' ');
+    const name = if (split) |index| clean[0..index] else clean;
+    const arguments = if (split) |index| clean[index + 1 ..] else "";
+    if (std.mem.eql(u8, name, "read")) {
+        const value = try engine.get(allocator, arguments) orelse return allocator.dupe(u8, "error");
+        return value.bytes;
     }
-
-    return null;
+    if (std.mem.eql(u8, name, "write")) {
+        const separator = std.mem.indexOfScalar(u8, arguments, '|') orelse return allocator.dupe(u8, "error");
+        _ = engine.put(arguments[0..separator], arguments[separator + 1 ..]) catch return allocator.dupe(u8, "error");
+        return allocator.dupe(u8, "success");
+    }
+    if (std.mem.eql(u8, name, "delete")) {
+        const deleted = engine.delete(arguments) catch return allocator.dupe(u8, "error");
+        return allocator.dupe(u8, if (deleted) "success" else "error");
+    }
+    if (std.mem.eql(u8, name, "status")) {
+        const status = engine.status();
+        return std.fmt.allocPrint(allocator, "well going our operation keys={d} latest_lsn={d} checkpoint_lsn={d} file_bytes={d} groups={d} transactions={d} largest_group={d}", .{ status.live_keys, status.latest_lsn, status.checkpoint_lsn, status.file_bytes, status.commit_groups, status.committed_transactions, status.largest_commit_group });
+    }
+    if (std.mem.eql(u8, name, "keys")) return scanText(engine, allocator, "", arguments, false);
+    if (std.mem.eql(u8, name, "reads")) return scanText(engine, allocator, arguments, "", true);
+    if (std.mem.eql(u8, name, "scan")) {
+        var fields = std.mem.splitScalar(u8, arguments, '|');
+        const prefix = fields.next() orelse "";
+        const cursor = fields.next() orelse "";
+        const limit_text = fields.next() orelse "256";
+        const mode = fields.next() orelse "keys";
+        const limit = std.fmt.parseInt(u32, limit_text, 10) catch return allocator.dupe(u8, "error");
+        return scanTextLimit(engine, allocator, prefix, cursor, std.mem.eql(u8, mode, "values"), limit);
+    }
+    if (std.mem.eql(u8, name, "checkpoint")) {
+        engine.checkpoint() catch return allocator.dupe(u8, "error");
+        return allocator.dupe(u8, "success");
+    }
+    return allocator.dupe(u8, "error");
 }
 
-// -- Tests --
-
-const test_allocator = std.heap.page_allocator;
-
-test "parse write command" {
-    storage.init();
-    const result = parse("write mykey|myvalue\r\n", test_allocator) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("success", result);
+fn scanText(engine: *Engine, allocator: std.mem.Allocator, prefix: []const u8, cursor: []const u8, values: bool) ![]u8 {
+    return scanTextLimit(engine, allocator, prefix, cursor, values, 256);
 }
 
-test "parse read command" {
-    storage.init();
-    // Write first, then read
-    _ = parse("write cmd_rk|cmd_rv", test_allocator);
-    const result = parse("read cmd_rk", test_allocator) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("cmd_rv", result);
+fn scanTextLimit(engine: *Engine, allocator: std.mem.Allocator, prefix: []const u8, cursor: []const u8, values: bool, limit: u32) ![]u8 {
+    var batch = engine.scan(allocator, prefix, cursor, @min(limit, 4096), values, max_text_response) catch return allocator.dupe(u8, "error");
+    defer batch.deinit(allocator);
+    var output = std.ArrayListUnmanaged(u8){};
+    errdefer output.deinit(allocator);
+    for (batch.entries, 0..) |entry, index| {
+        if (index != 0) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, if (values) entry.value.? else entry.key);
+    }
+    return output.toOwnedSlice(allocator);
 }
 
-test "parse read nonexistent" {
-    storage.init();
-    const result = parse("read cmd_nonexistent_key", test_allocator);
-    try std.testing.expectEqualStrings("error", result.?);
-}
-
-test "parse delete command" {
-    storage.init();
-    _ = parse("write cmd_dk|cmd_dv", test_allocator);
-    const result = parse("delete cmd_dk", test_allocator) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("success", result);
-
-    // Verify deleted
-    const after = parse("read cmd_dk", test_allocator);
-    try std.testing.expectEqualStrings("error", after.?);
-}
-
-test "parse delete nonexistent" {
-    storage.init();
-    const result = parse("delete cmd_nonexistent_del", test_allocator);
-    try std.testing.expectEqualStrings("error", result.?);
-}
-
-test "parse status command" {
-    const result = parse("status", test_allocator) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("well going our operation", result);
-}
-
-test "parse unknown command returns null" {
-    try std.testing.expectEqual(@as(?[]const u8, null), parse("foobar", test_allocator));
-    try std.testing.expectEqual(@as(?[]const u8, null), parse("", test_allocator));
-}
-
-test "parse trims whitespace" {
-    const result = parse("  status \r\n", test_allocator) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("well going our operation", result);
-}
-
-test "parseKeyValue splits on pipe" {
-    const kv = parseKeyValue("hello|world") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("hello", kv[0]);
-    try std.testing.expectEqualStrings("world", kv[1]);
-}
-
-test "parseKeyValue with multiple pipes" {
-    const kv = parseKeyValue("key|val|ue|extra") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("key", kv[0]);
-    try std.testing.expectEqualStrings("val|ue|extra", kv[1]);
+test "Pizzaria point compatibility and bounded scan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = try tmp.dir.realpath(".", &path_buffer);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/protocol.pkvdb", .{directory});
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    var response = try execute(&engine, std.testing.allocator, "write p/1|one\r");
+    try std.testing.expectEqualStrings("success", response);
+    std.testing.allocator.free(response);
+    response = try execute(&engine, std.testing.allocator, "read p/1\r");
+    try std.testing.expectEqualStrings("one", response);
+    std.testing.allocator.free(response);
+    response = try execute(&engine, std.testing.allocator, "scan p/||1|keys\r");
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings("p/1", response);
 }

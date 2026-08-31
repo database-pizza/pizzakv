@@ -65,7 +65,15 @@ make clean
 # Start server in Pizzaria mode (\r-delimited protocol, port 8085)
 ./pizzakv
 
-# The server will create a .db file for persistence
+# Custom port
+./pizzakv -port=9000
+
+# Unix socket mode (creates .pizzakv.sock in current directory)
+./pizzakv -unix
+./pizzakv -unix -redis
+
+# The server will create a .db file for persistence.
+# In unix mode, a .pizzakv.sock file is also created and removed on shutdown.
 ```
 
 ## Benchmarking
@@ -158,7 +166,7 @@ pizzakv/
 ├── hashing.zig        # Hash function
 ├── redis.zig          # RESP protocol parser
 ├── command.zig        # Command execution
-├── socket.zig         # TCP socket operations
+├── socket.zig         # TCP and Unix socket operations
 └── benchmark_*.sh     # Benchmark scripts
 ```
 

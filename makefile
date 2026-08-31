@@ -26,18 +26,14 @@ clean:
 	rm -f pizzakv
 
 test:
-	zig test hashing.zig
-	zig test redis.zig
-	zig test storage.zig
-	zig test index.zig
+	zig test pkvdb.zig
+	zig test keydir.zig
+	zig test ordered_index.zig
+	zig test engine.zig
 	zig test command.zig
-	zig test persistence.zig
+	zig test redis.zig
+	zig test pkbfi.zig
+	zig test migration.zig
 
 bench:
-	node tools/test_nov.js
-	node tools/test_accuracy.js
-	node tools/test_comprehensive.js
-	node tools/test_concurrent.js
-	node tools/test_concurrent_reads.js
-	node tools/test_concurrent_reads_quick.js
-	node tools/test_reads_keys.js
+	zig run benchmark.zig -O ReleaseFast
