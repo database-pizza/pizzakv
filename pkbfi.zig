@@ -195,7 +195,7 @@ pub const Session = struct {
         const requested = readInt(u32, payload, 8);
         const scan = &self.scans.items[index];
         const limit = if (requested == 0) scan.limit else @min(requested, scan.limit);
-        var batch = try engine.scan(self.allocator, scan.prefix, scan.cursor, limit, scan.include_values, 1024 * 1024);
+        var batch = try engine.scan(self.allocator, scan.prefix, scan.cursor, limit, scan.include_values, max_frame_size - 10);
         defer batch.deinit(self.allocator);
         try body.append(self.allocator, @intFromBool(batch.done));
         try body.appendNTimes(self.allocator, 0, 3);

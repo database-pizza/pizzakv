@@ -883,7 +883,7 @@ pub const Engine = struct {
     }
 
     pub fn scan(self: *Engine, allocator: std.mem.Allocator, prefix: []const u8, cursor: []const u8, limit: u32, include_values: bool, max_bytes: u32) !ScanBatch {
-        if (prefix.len > pkvdb.max_key_size or cursor.len > pkvdb.max_key_size or limit == 0 or limit > 4096 or max_bytes == 0 or max_bytes > 1024 * 1024) return error.InvalidLength;
+        if (prefix.len > pkvdb.max_key_size or cursor.len > pkvdb.max_key_size or limit == 0 or limit > 4096 or max_bytes == 0 or max_bytes > pkvdb.max_key_size + pkvdb.max_value_size + 1024) return error.InvalidLength;
         try self.ensureOrdered();
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -901,7 +901,7 @@ pub const Engine = struct {
         while (node) |current| {
             if (entries.items.len >= limit or !std.mem.startsWith(u8, current.key, prefix)) break;
             const record = current.record;
-            const next_size = current.key.len + if (include_values) record.value_len else 0;
+            const next_size = 16 + current.key.len + if (include_values) record.value_len else 0;
             if (next_size > max_bytes) return error.ScanEntryTooLarge;
             if (bytes_used + next_size > max_bytes) break;
             const key = try allocator.dupe(u8, current.key);
