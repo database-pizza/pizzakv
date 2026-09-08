@@ -17,6 +17,7 @@ pub const Opcode = enum(u16) {
     scan_open = 9,
     scan_next = 10,
     scan_close = 11,
+    compare_batch_write = 12,
 };
 
 pub const Frame = struct {
@@ -106,6 +107,7 @@ pub const Session = struct {
             },
             .multi_get => try self.multiGet(engine, frame.payload, body),
             .batch_write => try self.batchWrite(engine, frame.payload, body),
+            .compare_batch_write => try self.compareBatchWrite(engine, frame.payload, body),
             .scan_open => try self.scanOpen(frame.payload, body),
             .scan_next => try self.scanNext(engine, frame.payload, body),
             .scan_close => try self.scanClose(frame.payload, body),
@@ -170,6 +172,52 @@ pub const Session = struct {
         }
         if (position != payload.len) return error.InvalidPayload;
         try appendInt(u64, body, self.allocator, try engine.batchWrite(operations, metadata));
+    }
+
+    fn compareBatchWrite(self: *Session, engine: *engine_mod.Engine, payload: []const u8, body: *std.ArrayListUnmanaged(u8)) !void {
+        if (payload.len < 16) return error.InvalidPayload;
+        const check_count = readInt(u32, payload, 0);
+        const op_count = readInt(u32, payload, 4);
+        const metadata_length = readInt(u32, payload, 8);
+        if (op_count == 0 or op_count > pkvdb.max_operations or check_count > pkvdb.max_operations) return error.InvalidPayload;
+        const checks = try self.allocator.alloc(engine_mod.CompareCheck, check_count);
+        defer self.allocator.free(checks);
+        var position: usize = 16;
+        for (checks) |*check| {
+            if (position > payload.len or payload.len - position < 16) return error.InvalidPayload;
+            const key_length = readInt(u32, payload, position);
+            position += 4;
+            position += 4;
+            const expected_lsn = readInt(u64, payload, position);
+            position += 8;
+            const end = try std.math.add(usize, position, key_length);
+            if (end > payload.len or key_length > pkvdb.max_key_size) return error.InvalidPayload;
+            check.* = .{ .key = payload[position..end], .expected_lsn = expected_lsn };
+            position = end;
+        }
+        if (position > payload.len or payload.len - position < metadata_length) return error.InvalidPayload;
+        const metadata_end = position + metadata_length;
+        const metadata = payload[position..metadata_end];
+        const operations = try self.allocator.alloc(engine_mod.Operation, op_count);
+        defer self.allocator.free(operations);
+        position = metadata_end;
+        for (operations) |*operation| {
+            if (position > payload.len or payload.len - position < 12) return error.InvalidPayload;
+            const opcode: pkvdb.Opcode = std.meta.intToEnum(pkvdb.Opcode, payload[position]) catch return error.InvalidPayload;
+            const key_length = readInt(u32, payload, position + 4);
+            const value_length = readInt(u32, payload, position + 8);
+            position += 12;
+            const key_end = try std.math.add(usize, position, key_length);
+            const value_end = try std.math.add(usize, key_end, value_length);
+            if (value_end > payload.len or key_length > pkvdb.max_key_size or value_length > pkvdb.max_value_size or (opcode == .delete and value_length != 0)) return error.InvalidPayload;
+            operation.* = .{ .opcode = opcode, .key = payload[position..key_end], .value = payload[key_end..value_end] };
+            position = value_end;
+        }
+        if (position != payload.len) return error.InvalidPayload;
+        const result = try engine.compareBatchWrite(checks, operations, metadata);
+        try body.append(self.allocator, @intFromBool(result.committed));
+        try body.appendNTimes(self.allocator, 0, 7);
+        try appendInt(u64, body, self.allocator, result.lsn);
     }
 
     fn scanOpen(self: *Session, payload: []const u8, body: *std.ArrayListUnmanaged(u8)) !void {
@@ -339,4 +387,49 @@ test "PKBFI binary point batch and streaming scan" {
     defer std.testing.allocator.free(next_response);
     const next_frame = try parse(next_response);
     try std.testing.expectEqual(@as(u32, 1), readInt(u32, next_frame.payload, 6));
+}
+
+test "PKBFI compare batch write commit and conflict" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = try tmp.dir.realpath(".", &path_buffer);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/pkbfi-compare.pkvdb", .{directory});
+    defer std.testing.allocator.free(path);
+    var engine = try engine_mod.Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    var session = Session.init(std.testing.allocator);
+    defer session.deinit();
+
+    var payload = [_]u8{0} ** 47;
+    writeInt(u32, &payload, 0, 1);
+    writeInt(u32, &payload, 4, 1);
+    writeInt(u32, &payload, 8, 0);
+    var position: usize = 16;
+    writeInt(u32, &payload, position, 1);
+    writeInt(u64, &payload, position + 8, 0);
+    position += 16;
+    payload[position] = 'k';
+    position += 1;
+    payload[position] = @intFromEnum(pkvdb.Opcode.put);
+    writeInt(u32, &payload, position + 4, 1);
+    writeInt(u32, &payload, position + 8, 1);
+    position += 12;
+    payload[position] = 'k';
+    position += 1;
+    payload[position] = 'v';
+
+    const response = try session.execute(&engine, .{ .opcode = .compare_batch_write, .flags = 0, .request_id = 1, .payload = &payload, .consumed = 0 });
+    defer std.testing.allocator.free(response);
+    const frame = try parse(response);
+    try std.testing.expectEqual(@as(u16, 0), readInt(u16, frame.payload, 0));
+    try std.testing.expectEqual(@as(u8, 1), frame.payload[2]);
+    try std.testing.expectEqual(@as(u64, 1), readInt(u64, frame.payload, 10));
+
+    const conflict_response = try session.execute(&engine, .{ .opcode = .compare_batch_write, .flags = 0, .request_id = 2, .payload = &payload, .consumed = 0 });
+    defer std.testing.allocator.free(conflict_response);
+    const conflict_frame = try parse(conflict_response);
+    try std.testing.expectEqual(@as(u16, 0), readInt(u16, conflict_frame.payload, 0));
+    try std.testing.expectEqual(@as(u8, 0), conflict_frame.payload[2]);
+    try std.testing.expectEqual(@as(u64, 0), readInt(u64, conflict_frame.payload, 10));
 }

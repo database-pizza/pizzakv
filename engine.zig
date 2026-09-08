@@ -18,6 +18,16 @@ pub const Value = struct {
     lsn: u64,
 };
 
+pub const CompareCheck = struct {
+    key: []const u8,
+    expected_lsn: u64,
+};
+
+pub const CompareBatchResult = struct {
+    lsn: u64,
+    committed: bool,
+};
+
 pub const ScanEntry = struct {
     key: []u8,
     value: ?[]u8,
@@ -70,9 +80,11 @@ const Root = struct {
 const PendingWrite = struct {
     operations: []const Operation,
     metadata: []const u8,
+    checks: []const CompareCheck = &.{},
     next: ?*PendingWrite = null,
     completion: *WriteCompletion,
     lsn: u64 = 0,
+    committed: bool = true,
     frame_position: usize = 0,
     changed: bool = false,
     prepared_position: usize = 0,
@@ -586,6 +598,24 @@ pub const Engine = struct {
         return pending.lsn;
     }
 
+    pub fn compareBatchWrite(self: *Engine, checks: []const CompareCheck, operations: []const Operation, metadata: []const u8) !CompareBatchResult {
+        if (operations.len == 0 or operations.len > pkvdb.max_operations or metadata.len > pkvdb.max_transaction_size) return error.InvalidLength;
+        if (checks.len > pkvdb.max_operations) return error.InvalidLength;
+        for (operations) |operation| {
+            if (operation.key.len > pkvdb.max_key_size or operation.value.len > pkvdb.max_value_size) return error.InvalidLength;
+            if (operation.opcode == .delete and operation.value.len != 0) return error.InvalidLength;
+        }
+        for (checks) |check| {
+            if (check.key.len > pkvdb.max_key_size) return error.InvalidLength;
+        }
+        const frame_length = try transactionLength(operations, metadata);
+        var completion = WriteCompletion{ .remaining = 1 };
+        var pending = PendingWrite{ .operations = operations, .metadata = metadata, .checks = checks, .bytes = frame_length, .completion = &completion };
+        try self.enqueueAndWait(&.{&pending}, &completion);
+        if (completion.failure) |failure| return failure;
+        return .{ .lsn = pending.lsn, .committed = pending.committed };
+    }
+
     pub fn putMany(self: *Engine, operations: []const Operation, lsns: []u64) !void {
         if (operations.len == 0 or operations.len != lsns.len or operations.len > max_group_transactions) return error.InvalidLength;
         const pending = try self.allocator.alloc(PendingWrite, operations.len);
@@ -634,8 +664,9 @@ pub const Engine = struct {
             _ = self.queue_condition.timedWait(&self.queue_mutex, group_wait_ns) catch {};
             var count: usize = 0;
             var bytes: usize = pkvdb.group_header_size;
+            var conditional: bool = false;
             while (self.queue_head) |pending| {
-                if (count != 0 and (count == group.len or bytes + pending.bytes > max_group_bytes)) break;
+                if (count != 0 and (count == group.len or bytes + pending.bytes > max_group_bytes or conditional or pending.checks.len != 0)) break;
                 self.queue_head = pending.next;
                 if (self.queue_head == null) self.queue_tail = null;
                 pending.next = null;
@@ -643,6 +674,7 @@ pub const Engine = struct {
                 count += 1;
                 bytes += pending.bytes;
                 self.queued_bytes -= pending.bytes;
+                conditional = pending.checks.len != 0;
             }
             self.queue_condition.broadcast();
             self.queue_mutex.unlock();
@@ -675,6 +707,18 @@ pub const Engine = struct {
         }
     }
 
+    fn checkConditions(self: *Engine, checks: []const CompareCheck) !bool {
+        for (checks) |check| {
+            const record = try self.directory.get(self.file, check.key);
+            if (check.expected_lsn == 0) {
+                if (record != null) return false;
+            } else if (record == null or record.?.lsn != check.expected_lsn) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn processGroup(self: *Engine, group: []*PendingWrite, payload_length: usize) !void {
         var operation_count: usize = 0;
         for (group) |pending| operation_count = try std.math.add(usize, operation_count, pending.operations.len);
@@ -683,6 +727,22 @@ pub const Engine = struct {
         self.ordered_gate.lock();
         defer self.ordered_gate.unlock();
         self.lock.lock();
+        if (group[0].checks.len != 0) {
+            if (group.len != 1) {
+                self.lock.unlock();
+                return error.InvalidConditionalGroup;
+            }
+            const conditions_match = self.checkConditions(group[0].checks) catch |failure| {
+                self.lock.unlock();
+                return failure;
+            };
+            if (!conditions_match) {
+                group[0].committed = false;
+                group[0].lsn = 0;
+                self.lock.unlock();
+                return;
+            }
+        }
         self.directory.ensureAdditional(self.file, operation_count) catch |failure| {
             self.lock.unlock();
             return failure;
@@ -1107,6 +1167,32 @@ test "atomic batch checkpoint tail and ordered scan" {
     try std.testing.expectEqualStrings("p/3", batch.entries[0].key);
 }
 
+test "scan supports full-size PKBFI pages and accounts for entry framing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try testPath(&tmp, "large-scan.pkvdb", &path_buffer);
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+
+    const value = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'x');
+    _ = try engine.put("large/key", value);
+
+    const entry_size = 16 + "large/key".len + value.len;
+    var batch = try engine.scan(std.testing.allocator, "large/", "", 1, true, @intCast(entry_size));
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), batch.entries.len);
+    try std.testing.expectEqual(value.len, batch.entries[0].value.?.len);
+
+    try std.testing.expectError(
+        error.ScanEntryTooLarge,
+        engine.scan(std.testing.allocator, "large/", "", 1, true, @intCast(entry_size - 1)),
+    );
+}
+
 fn testPath(tmp: *std.testing.TmpDir, name: []const u8, buffer: *[std.fs.max_path_bytes]u8) ![]const u8 {
     const directory = try tmp.dir.realpath(".", buffer);
     return std.fs.path.join(std.testing.allocator, &.{ directory, name });
@@ -1418,4 +1504,94 @@ test "concurrent delete reports one removal" {
     second.join();
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(results[0] != results[1]);
+}
+
+test "compare batch write absent match and stale conflict" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try testPath(&tmp, "compare.pkvdb", &path_buffer);
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+
+    const absent_checks = [_]CompareCheck{.{ .key = "k", .expected_lsn = 0 }};
+    var result = try engine.compareBatchWrite(&absent_checks, &.{.{ .opcode = .put, .key = "k", .value = "one" }}, "meta");
+    try std.testing.expect(result.committed);
+    try std.testing.expectEqual(@as(u64, 1), result.lsn);
+
+    const match_checks = [_]CompareCheck{.{ .key = "k", .expected_lsn = result.lsn }};
+    result = try engine.compareBatchWrite(&match_checks, &.{.{ .opcode = .put, .key = "k", .value = "two" }}, "");
+    try std.testing.expect(result.committed);
+    try std.testing.expectEqual(@as(u64, 2), result.lsn);
+
+    const stale_checks = [_]CompareCheck{.{ .key = "k", .expected_lsn = 1 }};
+    result = try engine.compareBatchWrite(&stale_checks, &.{.{ .opcode = .put, .key = "k", .value = "three" }}, "");
+    try std.testing.expect(!result.committed);
+    try std.testing.expectEqual(@as(u64, 0), result.lsn);
+
+    var value = (try engine.get(std.testing.allocator, "k")).?;
+    try std.testing.expectEqualStrings("two", value.bytes);
+    try std.testing.expectEqual(@as(u64, 2), value.lsn);
+    std.testing.allocator.free(value.bytes);
+
+    engine.close();
+    engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    value = (try engine.get(std.testing.allocator, "k")).?;
+    defer std.testing.allocator.free(value.bytes);
+    try std.testing.expectEqualStrings("two", value.bytes);
+    try std.testing.expectEqual(@as(u64, 2), value.lsn);
+}
+
+test "compare absent check rejects existing key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try testPath(&tmp, "compare-absent.pkvdb", &path_buffer);
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    _ = try engine.put("k", "seed");
+    const checks = [_]CompareCheck{.{ .key = "k", .expected_lsn = 0 }};
+    const result = try engine.compareBatchWrite(&checks, &.{.{ .opcode = .put, .key = "k", .value = "x" }}, "");
+    try std.testing.expect(!result.committed);
+    try std.testing.expectEqual(@as(u64, 0), result.lsn);
+    const value = (try engine.get(std.testing.allocator, "k")).?;
+    defer std.testing.allocator.free(value.bytes);
+    try std.testing.expectEqualStrings("seed", value.bytes);
+}
+
+test "concurrent compare batch writes expecting same lsn commit exactly one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try testPath(&tmp, "compare-race.pkvdb", &path_buffer);
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    _ = try engine.put("key", "seed");
+    var results: [2]CompareBatchResult = undefined;
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(target: *Engine, result: *CompareBatchResult, failure: *std.atomic.Value(bool)) void {
+            const checks = [_]CompareCheck{.{ .key = "key", .expected_lsn = 1 }};
+            const operations = [_]Operation{.{ .opcode = .put, .key = "key", .value = "winner" }};
+            result.* = target.compareBatchWrite(&checks, &operations, "") catch {
+                failure.store(true, .release);
+                return;
+            };
+        }
+    };
+    const first = try std.Thread.spawn(.{}, Worker.run, .{ &engine, &results[0], &failed });
+    const second = try std.Thread.spawn(.{}, Worker.run, .{ &engine, &results[1], &failed });
+    first.join();
+    second.join();
+    try std.testing.expect(!failed.load(.acquire));
+    const committed = @as(u64, @intFromBool(results[0].committed)) + @as(u64, @intFromBool(results[1].committed));
+    try std.testing.expectEqual(@as(u64, 1), committed);
+    const winner = if (results[0].committed) results[0] else results[1];
+    try std.testing.expectEqual(@as(u64, 2), winner.lsn);
+    const value = (try engine.get(std.testing.allocator, "key")).?;
+    defer std.testing.allocator.free(value.bytes);
+    try std.testing.expectEqualStrings("winner", value.bytes);
 }
