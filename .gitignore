@@ -9,5 +9,6 @@ tools/
 .dbb
 test_nov.js
 bin/
+dist/
 /pizzakv_*
 .DS_Store

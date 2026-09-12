@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build, test, and verify FreeBSD ARM64 artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Check formatting
+        run: zig fmt --check *.zig
+
+      - name: Run tests
+        run: make test
+
+      - name: Build native binary
+        run: make build
+
+      - name: Verify version output
+        run: |
+          expected="$(cat VERSION)"
+          got="$(./bin/pizzakv -version)"
+          echo "version output: $got"
+          test "$got" = "PizzaKV $expected"
+
+      - name: Cross-compile release targets
+        run: |
+          make build-amd64
+          make build-amd64-freebsd
+          make build-arm64-freebsd
+          make build-amd64-static
+
+      - name: Stage artifacts and checksums
+        run: |
+          version="$(cat VERSION)"
+          mkdir -p dist
+          cp bin/pizzakv               "dist/pizzakv-${version}-linux-amd64"
+          cp bin/pizzakv_amd64         "dist/pizzakv-${version}-linux-amd64-portable"
+          cp bin/pizzakv_amd64_static  "dist/pizzakv-${version}-linux-amd64-static"
+          cp bin/pizzakv_amd64_freebsd "dist/pizzakv-${version}-freebsd-amd64"
+          cp bin/pizzakv_arm64_freebsd "dist/pizzakv-${version}-freebsd-arm64"
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload verification artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pizzakv-${{ github.sha }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

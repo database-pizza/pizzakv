@@ -7,6 +7,7 @@ const pizzaria = @import("command.zig");
 const resp = @import("redis.zig");
 const pkbfi = @import("pkbfi.zig");
 const migration = @import("migration.zig");
+const version = @import("version.zig");
 
 const initial_buffer = 64 * 1024;
 const max_connection_bytes = 512 * 1024 * 1024;
@@ -342,7 +343,11 @@ pub fn main() !void {
     defer args.deinit();
     _ = args.skip();
     while (args.next()) |argument| {
-        if (std.mem.startsWith(u8, argument, "-host=")) host = argument[6..] else if (std.mem.startsWith(u8, argument, "-port=")) port = try std.fmt.parseInt(u16, argument[6..], 10) else if (std.mem.startsWith(u8, argument, "-path=")) path = argument[6..] else if (std.mem.startsWith(u8, argument, "-migrate=")) migration_source = argument[9..] else if (std.mem.eql(u8, argument, "-unix")) unix_path = ".pizzakv.sock" else if (std.mem.startsWith(u8, argument, "-unix=")) unix_path = argument[6..] else if (std.mem.eql(u8, argument, "-redis") or std.mem.eql(u8, argument, "-pkbfi") or std.mem.eql(u8, argument, "-iwal")) {} else return error.InvalidArgument;
+        if (std.mem.startsWith(u8, argument, "-host=")) host = argument[6..] else if (std.mem.startsWith(u8, argument, "-port=")) port = try std.fmt.parseInt(u16, argument[6..], 10) else if (std.mem.startsWith(u8, argument, "-path=")) path = argument[6..] else if (std.mem.startsWith(u8, argument, "-migrate=")) migration_source = argument[9..] else if (std.mem.eql(u8, argument, "-unix")) unix_path = ".pizzakv.sock" else if (std.mem.startsWith(u8, argument, "-unix=")) unix_path = argument[6..] else if (std.mem.eql(u8, argument, "-redis") or std.mem.eql(u8, argument, "-pkbfi") or std.mem.eql(u8, argument, "-iwal")) {} else if (std.mem.eql(u8, argument, "-version") or std.mem.eql(u8, argument, "--version") or std.mem.eql(u8, argument, "-v")) {
+            var buffer: [64]u8 = undefined;
+            try std.fs.File.stdout().writeAll(try std.fmt.bufPrint(&buffer, "PizzaKV {s}\n", .{version.string}));
+            return;
+        } else return error.InvalidArgument;
     }
     if (migration_source) |source| {
         const result = try migration.migrate(std.heap.smp_allocator, source, path);
@@ -357,7 +362,7 @@ pub fn main() !void {
     const listener = if (unix_path) |name| try socket.initUnix(name) else try socket.init(host, port);
     defer posix.close(listener);
     defer if (unix_path) |name| posix.unlink(name) catch {};
-    std.debug.print("PizzaKV {s} Pizzaria/RESP/PKBFI\n", .{path});
+    std.debug.print("PizzaKV {s} ({s}) Pizzaria/RESP/PKBFI\n", .{ version.string, path });
     while (!should_exit.load(.acquire)) {
         var descriptors = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
         if ((posix.poll(&descriptors, 100) catch continue) == 0) continue;
