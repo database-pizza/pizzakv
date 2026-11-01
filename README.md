@@ -155,6 +155,12 @@ exact-key reader (with file-read fallback) as GET; hash equality alone never
 establishes key equality. These optimizations do not change the file format,
 LSN ordering, or durability contract.
 
+SCAN snapshots a page-bounded set of immutable journal record references under
+the publication gate, then allocates/copies keys and values outside that gate.
+It never borrows ordered-tree nodes after unlock. This relies on the same
+append-only record lifetime as GET/MULTI_GET; a future reclaiming compactor must
+pin those readers before removing old extents.
+
 ### Thread Safety
 
 - Shard-level RwLocks for concurrent hash table access
