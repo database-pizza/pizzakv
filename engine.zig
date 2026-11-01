@@ -953,41 +953,69 @@ pub const Engine = struct {
     pub fn scan(self: *Engine, allocator: std.mem.Allocator, prefix: []const u8, cursor: []const u8, limit: u32, include_values: bool, max_bytes: u32) !ScanBatch {
         if (prefix.len > pkvdb.max_key_size or cursor.len > pkvdb.max_key_size or limit == 0 or limit > 4096 or max_bytes == 0 or max_bytes > pkvdb.max_key_size + pkvdb.max_value_size + 1024) return error.InvalidLength;
         try self.ensureOrdered();
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
-        var node = self.ordered.lowerBound(if (cursor.len == 0) prefix else cursor);
-        if (cursor.len != 0 and node != null and std.mem.eql(u8, node.?.key, cursor)) node = ordered_index.OrderedIndex.next(node.?);
-        var entries = std.ArrayListUnmanaged(ScanEntry){};
+        const ScanRef = struct { record: RecordRef, key_offset: ?u32 = null };
+        const refs = try allocator.alloc(ScanRef, limit);
+        defer allocator.free(refs);
+        // Copy short keys into a bounded arena to avoid adding pread calls for
+        // small, not-yet-mapped journal tails. Large keys use immutable records.
+        const key_snapshot = try allocator.alloc(u8, @min(max_bytes, limit * 64, 64 * 1024));
+        defer allocator.free(key_snapshot);
+        const snapshot = blk: {
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            var node = self.ordered.lowerBound(if (cursor.len == 0) prefix else cursor);
+            if (cursor.len != 0 and node != null and std.mem.eql(u8, node.?.key, cursor)) node = ordered_index.OrderedIndex.next(node.?);
+            var count: usize = 0;
+            var bytes_used: usize = 0;
+            var key_bytes: usize = 0;
+            while (node) |current| {
+                if (count >= limit or !std.mem.startsWith(u8, current.key, prefix)) break;
+                const record = current.record;
+                const next_size = 16 + current.key.len + if (include_values) record.value_len else 0;
+                if (next_size > max_bytes) return error.ScanEntryTooLarge;
+                if (bytes_used + next_size > max_bytes) break;
+                refs[count] = .{ .record = record };
+                if (current.key.len <= key_snapshot.len - key_bytes) {
+                    @memcpy(key_snapshot[key_bytes .. key_bytes + current.key.len], current.key);
+                    refs[count].key_offset = @intCast(key_bytes);
+                    key_bytes += current.key.len;
+                }
+                count += 1;
+                bytes_used += next_size;
+                node = ordered_index.OrderedIndex.next(current);
+            }
+            break :blk .{ .count = count, .done = node == null or !std.mem.startsWith(u8, node.?.key, prefix) };
+        };
+        // Journal records remain immutable for the engine's lifetime, just as
+        // for getRef/multiGet. Never retain ordered-tree nodes past the gate:
+        // deletes may free them while these bounded record copies are read.
+        const entries = try allocator.alloc(ScanEntry, snapshot.count);
+        var initialized: usize = 0;
         errdefer {
-            for (entries.items) |entry| {
+            for (entries[0..initialized]) |entry| {
                 allocator.free(entry.key);
                 if (entry.value) |value| allocator.free(value);
             }
-            entries.deinit(allocator);
+            allocator.free(entries);
         }
-        var bytes_used: usize = 0;
-        while (node) |current| {
-            if (entries.items.len >= limit or !std.mem.startsWith(u8, current.key, prefix)) break;
-            const record = current.record;
-            const next_size = 16 + current.key.len + if (include_values) record.value_len else 0;
-            if (next_size > max_bytes) return error.ScanEntryTooLarge;
-            if (bytes_used + next_size > max_bytes) break;
-            const key = try allocator.dupe(u8, current.key);
+        for (refs[0..snapshot.count], entries) |saved, *entry| {
+            const record = saved.record;
+            const key = try allocator.alloc(u8, record.key_len);
             errdefer allocator.free(key);
+            if (saved.key_offset) |offset| {
+                @memcpy(key, key_snapshot[offset .. offset + key.len]);
+            } else if (try self.readBytes(key, record.key_offset) != key.len) return error.Truncated;
             var value: ?[]u8 = null;
             if (include_values) {
                 value = try allocator.alloc(u8, record.value_len);
                 errdefer allocator.free(value.?);
                 _ = try self.readValue(record, value.?, 0);
             }
-            try entries.append(allocator, .{ .key = key, .value = value, .lsn = record.lsn });
-            bytes_used += next_size;
-            node = ordered_index.OrderedIndex.next(current);
+            entry.* = .{ .key = key, .value = value, .lsn = record.lsn };
+            initialized += 1;
         }
-        const next_cursor = if (entries.items.len == 0) try allocator.alloc(u8, 0) else try allocator.dupe(u8, entries.items[entries.items.len - 1].key);
-        errdefer allocator.free(next_cursor);
-        const done = node == null or !std.mem.startsWith(u8, node.?.key, prefix);
-        return .{ .entries = try entries.toOwnedSlice(allocator), .next_cursor = next_cursor, .done = done };
+        const next_cursor = if (entries.len == 0) try allocator.alloc(u8, 0) else try allocator.dupe(u8, entries[entries.len - 1].key);
+        return .{ .entries = entries, .next_cursor = next_cursor, .done = snapshot.done };
     }
 
     fn ensureOrdered(self: *Engine) !void {
@@ -1549,6 +1577,78 @@ test "compare batch write absent match and stale conflict" {
     defer std.testing.allocator.free(value.bytes);
     try std.testing.expectEqualStrings("two", value.bytes);
     try std.testing.expectEqual(@as(u64, 2), value.lsn);
+}
+
+test "scan materializes immutable records outside the publication gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try testPath(&tmp, "scan-snapshot.pkvdb", &path_buffer);
+    defer std.testing.allocator.free(path);
+    var engine = try Engine.open(std.testing.allocator, path);
+    defer engine.close();
+    const original = [_]u8{'x'} ** 12345;
+    _ = try engine.put("a", &original);
+    _ = try engine.put("b", &original);
+    const long_key = [_]u8{'c'} ** 1024;
+    _ = try engine.put(&long_key, &original);
+    const Probe = struct {
+        engine: *Engine,
+        large_key: []const u8,
+        locked_allocations: usize = 0,
+        changed: bool = false,
+        fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const unlocked = self.engine.lock.tryLock();
+            if (unlocked) self.engine.lock.unlock() else self.locked_allocations += 1;
+            if (unlocked and len == 12345 and !self.changed) {
+                self.changed = true;
+                _ = self.engine.put("a", "replacement") catch return null;
+                _ = self.engine.delete("b") catch return null;
+                _ = self.engine.delete(self.large_key) catch return null;
+                self.engine.checkpoint() catch return null;
+            }
+            return std.testing.allocator.rawAlloc(len, alignment, address);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, address);
+        }
+    };
+    var probe = Probe{ .engine = &engine, .large_key = &long_key };
+    const allocator = std.mem.Allocator{ .ptr = &probe, .vtable = &.{ .alloc = Probe.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = Probe.free } };
+    var batch = try engine.scan(allocator, "", "", 8, true, 50000);
+    defer batch.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), probe.locked_allocations);
+    try std.testing.expect(probe.changed);
+    try std.testing.expect(batch.done);
+    try std.testing.expectEqual(@as(usize, 3), batch.entries.len);
+    try std.testing.expectEqualStrings("a", batch.entries[0].key);
+    try std.testing.expectEqualStrings("b", batch.entries[1].key);
+    try std.testing.expectEqualStrings(&long_key, batch.entries[2].key);
+    try std.testing.expectEqualStrings(&original, batch.entries[0].value.?);
+    try std.testing.expectEqualStrings(&original, batch.entries[1].value.?);
+    try std.testing.expectEqual(@as(u64, 1), batch.entries[0].lsn);
+    try std.testing.expectEqual(@as(u64, 2), batch.entries[1].lsn);
+    try std.testing.expectEqualStrings(&original, batch.entries[2].value.?);
+    try std.testing.expectEqual(@as(u64, 3), batch.entries[2].lsn);
+    try std.testing.expectEqualStrings(&long_key, batch.next_cursor);
+    const current = (try engine.get(std.testing.allocator, "a")).?;
+    defer std.testing.allocator.free(current.bytes);
+    try std.testing.expectEqualStrings("replacement", current.bytes);
+    try std.testing.expect((try engine.getRef("b")) == null);
+    try std.testing.expect((try engine.getRef(&long_key)) == null);
+    _ = try engine.put(&long_key, "long-value");
+    const FailureProbe = struct {
+        fn run(alloc: std.mem.Allocator, target: *Engine) !void {
+            var values = try target.scan(alloc, "", "", 8, true, 50000);
+            defer values.deinit(alloc);
+            var keys = try target.scan(alloc, "", "", 8, false, 50000);
+            defer keys.deinit(alloc);
+            var empty = try target.scan(alloc, "missing", "", 8, true, 50000);
+            defer empty.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureProbe.run, .{&engine});
 }
 
 test "conditional queue heads bypass group coalescing" {
