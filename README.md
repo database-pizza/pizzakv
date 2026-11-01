@@ -145,6 +145,16 @@ PizzaKV persists to a binary `.pkvdb` file. The file begins with a versioned,
 checksummed `PKVDB` superblock and stores records in PKBFI frames. Treat format
 changes as storage migrations, not as an append-only text-log change.
 
+### Durable commit path
+
+Writes are acknowledged only after the journal group has been synced and its
+records published. Unconditional writes can coalesce into one fsync. A
+conditional compare-batch remains an independent group and skips the coalescing
+wait because it cannot share that fsync. Compare checks use the same mapped
+exact-key reader (with file-read fallback) as GET; hash equality alone never
+establishes key equality. These optimizations do not change the file format,
+LSN ordering, or durability contract.
+
 ### Thread Safety
 
 - Shard-level RwLocks for concurrent hash table access

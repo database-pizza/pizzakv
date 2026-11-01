@@ -661,7 +661,11 @@ pub const Engine = struct {
                 self.queue_mutex.unlock();
                 return;
             }
-            _ = self.queue_condition.timedWait(&self.queue_mutex, group_wait_ns) catch {};
+            // Conditional transactions cannot share this commit group, so
+            // waiting for more queue entries cannot amortize their fsync.
+            if (canCoalesce(self.queue_head.?)) {
+                _ = self.queue_condition.timedWait(&self.queue_mutex, group_wait_ns) catch {};
+            }
             var count: usize = 0;
             var bytes: usize = pkvdb.group_header_size;
             var conditional: bool = false;
@@ -707,9 +711,13 @@ pub const Engine = struct {
         }
     }
 
+    fn canCoalesce(pending: *const PendingWrite) bool {
+        return pending.checks.len == 0;
+    }
+
     fn checkConditions(self: *Engine, checks: []const CompareCheck) !bool {
         for (checks) |check| {
-            const record = try self.directory.get(self.file, check.key);
+            const record = try self.directory.getWithReader(self.keyReader(), check.key);
             if (check.expected_lsn == 0) {
                 if (record != null) return false;
             } else if (record == null or record.?.lsn != check.expected_lsn) {
@@ -1541,6 +1549,14 @@ test "compare batch write absent match and stale conflict" {
     defer std.testing.allocator.free(value.bytes);
     try std.testing.expectEqualStrings("two", value.bytes);
     try std.testing.expectEqual(@as(u64, 2), value.lsn);
+}
+
+test "conditional queue heads bypass group coalescing" {
+    var completion = WriteCompletion{ .remaining = 1 };
+    var pending = PendingWrite{ .operations = &.{}, .metadata = "", .completion = &completion, .bytes = 0 };
+    try std.testing.expect(Engine.canCoalesce(&pending));
+    pending.checks = &.{.{ .key = "k", .expected_lsn = 1 }};
+    try std.testing.expect(!Engine.canCoalesce(&pending));
 }
 
 test "compare absent check rejects existing key" {
