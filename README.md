@@ -72,7 +72,7 @@ make clean
 ./pizzakv -unix
 ./pizzakv -unix -redis
 
-# The server will create a .db file for persistence.
+# The server creates a .pkvdb file for persistence by default.
 # In unix mode, a .pizzakv.sock file is also created and removed on shutdown.
 ```
 
@@ -139,15 +139,11 @@ Single-request latency comparison - the true test of performance.
 - FNV-1a hash with bit mixing for uniform distribution
 - Minimizes collisions across 1M buckets
 
-### Persistence Format
+### Persistence format
 
-Simple append-only format:
-```
-OPCODE|key|value\r
-```
-
-- `W|key|value\r` - Write operation
-- `D|key|\r` - Delete operation
+PizzaKV persists to a binary `.pkvdb` file. The file begins with a versioned,
+checksummed `PKVDB` superblock and stores records in PKBFI frames. Treat format
+changes as storage migrations, not as an append-only text-log change.
 
 ### Thread Safety
 
@@ -160,14 +156,16 @@ OPCODE|key|value\r
 ```
 pizzakv/
 ├── main.zig           # Server, connection handling
-├── storage.zig        # Sharded hash table
-├── index.zig          # Radix tree for prefix search
-├── persistence.zig    # AOF persistence layer
-├── hashing.zig        # Hash function
+├── engine.zig         # Storage engine and command coordination
+├── pkvdb.zig          # Durable file format and recovery
+├── pkbfi.zig          # Binary frame encoding
+├── keydir.zig         # In-memory key directory
+├── ordered_index.zig  # Ordered index for prefix operations
+├── migration.zig      # Legacy-format migration
 ├── redis.zig          # RESP protocol parser
 ├── command.zig        # Command execution
 ├── socket.zig         # TCP and Unix socket operations
-└── benchmark_*.sh     # Benchmark scripts
+└── benchmark.zig      # Benchmark runner
 ```
 
 ## Notes
@@ -175,4 +173,4 @@ pizzakv/
 - This implements a subset of RESP, not the full Redis protocol
 - RESP commands are limited to SET, GET, and DEL
 - The Pizzaria protocol provides additional commands (prefix search)
-- Built with Zig 0.15.1 using `-O ReleaseFast` optimization
+- Built with Zig 0.15.2 using `-O ReleaseFast` optimization
